@@ -1,8 +1,15 @@
 using System.Windows;
+using System.Windows.Media;
 
 namespace PDF_Reader.Models;
 
-public enum DocumentTool { Select, EditText, AddText, Highlight, Note }
+public enum DocumentTool { Select, EditText, AddText, Highlight, Underline, StrikeOut, Note, Rectangle, Ellipse, Ink }
+
+/// <summary>PDF annotation subtypes created by PaperDesk.</summary>
+public static class AnnotationType
+{
+    public const int Note = 1, Square = 5, Circle = 6, Highlight = 9, Underline = 10, Squiggly = 11, StrikeOut = 12, Ink = 15;
+}
 
 public enum PrintScaling { Fit, ActualSize, ShrinkOversized }
 
@@ -23,12 +30,21 @@ public record TextSelection(string Text, IReadOnlyList<Rect> Rectangles);
 
 public record EditableText(int PageIndex, int ObjectIndex, string Text, float FontSize, long Revision, Rect Bounds);
 
-public record PdfComment(int PageIndex, int AnnotationIndex, string Text, string Author, int Type)
+/// <summary>A review annotation. <see cref="Bounds"/> uses normalized display coordinates like other UI geometry.</summary>
+public record PdfComment(int PageIndex, int AnnotationIndex, string Text, string Author, int Type, Rect Bounds, Color Color)
 {
     // PDF annotation subtypes that represent review markup (links, popups and widgets are excluded).
     public static readonly IReadOnlySet<int> MarkupTypes = new HashSet<int> { 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 28 };
+    // PDFium regenerates the appearance of these subtypes from their colour (its note icon is always yellow).
+    private static readonly HashSet<int> Regenerated = [5, 6, 9, 10, 11, 12, 15];
+    // Their geometry is fully described by the rectangle (and ink strokes), so moving keeps the data consistent.
+    private static readonly HashSet<int> Movable = [1, 3, 5, 6, 13, 14, 15, 17];
 
     public int PageNumber => PageIndex + 1;
+    public bool CanMove => Movable.Contains(Type);
+    public bool CanResize => Type is 5 or 6;
+    public bool CanRecolor => Regenerated.Contains(Type);
+    public bool CanEditText => Type != 3;
 
     public string Kind => Type switch
     {

@@ -309,6 +309,7 @@ public partial class MainWindow : Window
         if (e.Key == Key.Escape)
         {
             if (_fullscreen) ToggleFullscreen();
+            else if (Workspace.SelectedAnnotation is not null) Workspace.SelectedAnnotation = null;
             else Workspace.Tool = DocumentTool.Select;
             e.Handled = true;
             return;
@@ -323,6 +324,7 @@ public partial class MainWindow : Window
         }
         ICommand? command = (e.Key, Keyboard.Modifiers) switch
         {
+            (Key.Delete, ModifierKeys.None) => Workspace.DeleteAnnotationCommand,
             (Key.Z, ModifierKeys.Control) => Workspace.UndoCommand,
             (Key.Y, ModifierKeys.Control) => Workspace.RedoCommand,
             (Key.PageDown, ModifierKeys.None) => Workspace.NextPageCommand,
@@ -362,7 +364,9 @@ public partial class MainWindow : Window
         "Ctrl+O — открыть PDF\nCtrl+N — новый PDF\nCtrl+S — сохранить\nCtrl+Shift+S — сохранить как\nCtrl+P — печать\nCtrl+F — поиск\n" +
         "F3 / Shift+F3 — следующее / предыдущее совпадение\nCtrl+C — копировать выделение\nCtrl+Z / Ctrl+Y — отменить / повторить правку PDF\n" +
         "PageUp / PageDown — страницы\nCtrl+Home / Ctrl+End — начало / конец\nCtrl+колесо — масштаб\nCtrl+0 — по ширине, Ctrl+1 — 100%\n" +
-        "F11 — полный экран\nCtrl+W — закрыть вкладку\nEsc — инструмент выделения / выход из полного экрана");
+        "F11 — полный экран\nCtrl+W — закрыть вкладку\n" +
+        "Delete — удалить выбранную аннотацию\nДвойной щелчок по аннотации — комментарий\n" +
+        "Esc — снять выделение аннотации / инструмент выделения / выход из полного экрана");
 
     private void About_Click(object sender, RoutedEventArgs e) => _dialogs.Info("О PaperDesk PDF",
         "PaperDesk PDF 1.0\nПросмотр, печать и редактирование документов.\n\n" +

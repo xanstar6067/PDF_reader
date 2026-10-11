@@ -10,6 +10,7 @@ using System.Windows.Threading;
 using PDF_Reader.Controls;
 using PDF_Reader.Models;
 using PDF_Reader.Services;
+using PDF_Reader.ViewModels;
 
 namespace PDF_Reader.Tests;
 
@@ -43,6 +44,7 @@ internal static class Program
             TestPrintLayout();
             Console.WriteLine("PASS: region rendering, aspect ratio limits, print placement");
             TestAnnotations();
+            TestAnnotationEditing(output);
             TestRecovery(output);
             Console.WriteLine("PASS: markup annotations, crash recovery");
             TestUi(output);
@@ -395,6 +397,90 @@ internal static class Program
         Throws<InvalidOperationException>(() => doc.DeleteComment(comments[0]), "stale annotation is rejected");
     }
 
+    private static readonly Color Red = Color.FromRgb(229, 57, 53);
+    private static readonly Color Blue = Color.FromRgb(30, 136, 229);
+    private static readonly Color Green = Color.FromRgb(67, 160, 71);
+
+    /// <summary>Colour at a normalized point of a page rendered 595 pixels wide.</summary>
+    private static Color PixelAt(PdfDocument doc, int page, Point point)
+    {
+        var image = new FormatConvertedBitmap(doc.Render(page, 595), PixelFormats.Bgra32, null, 0);
+        var x = Math.Clamp((int)(point.X * image.PixelWidth), 0, image.PixelWidth - 1);
+        var y = Math.Clamp((int)(point.Y * image.PixelHeight), 0, image.PixelHeight - 1);
+        var pixel = new byte[4];
+        image.CopyPixels(new Int32Rect(x, y, 1, 1), pixel, 4, 0);
+        return Color.FromRgb(pixel[2], pixel[1], pixel[0]);
+    }
+
+    private static bool Near(Color a, Color b) => Math.Abs(a.R - b.R) + Math.Abs(a.G - b.G) + Math.Abs(a.B - b.B) < 60;
+
+    private static bool Near(Rect a, Rect b) => Math.Abs(a.X - b.X) < .004 && Math.Abs(a.Y - b.Y) < .004 && Math.Abs(a.Width - b.Width) < .008 && Math.Abs(a.Height - b.Height) < .008;
+
+    private static Point LeftEdge(Rect bounds) => new(bounds.Left + 1.0 / 595, bounds.Top + bounds.Height / 2);
+
+    private static void TestAnnotationEditing(string output)
+    {
+        using var doc = PdfDocument.FromBytes(PdfFixture.Create());
+        var text = doc.Search("Hello reader", false, false, default).Single().Rectangles;
+        doc.AddTextMarkup(0, text, AnnotationType.Underline, Green);
+        doc.AddTextMarkup(0, text, AnnotationType.StrikeOut, Red);
+        doc.AddShape(0, new Rect(.2, .4, .3, .15), AnnotationType.Square, Red, 3);
+        doc.AddShape(0, new Rect(.55, .4, .25, .15), AnnotationType.Circle, Blue, 2);
+        doc.AddInk(0, [new(.1, .8), new(.2, .85), new(.3, .8)], Blue, 3);
+        doc.AddNote(0, new(.85, .9), "Проверить");
+        var comments = doc.GetComments(0);
+        Check(comments.Select(c => c.Kind).SequenceEqual(["Подчёркивание", "Зачёркивание", "Прямоугольник", "Овал", "Рисунок", "Заметка"]), "all annotation tools create standard PDF annotations");
+        var square = comments.Single(c => c.Type == AnnotationType.Square);
+        var circle = comments.Single(c => c.Type == AnnotationType.Circle);
+        var ink = comments.Single(c => c.Type == AnnotationType.Ink);
+        var underline = comments.Single(c => c.Type == AnnotationType.Underline);
+        Check(Near(square.Bounds, new Rect(.2, .4, .3, .15)) && square.Color == Red && circle.Color == Blue, "annotation geometry and colour are read back");
+        Check(Near(PixelAt(doc, 0, LeftEdge(square.Bounds)), Red) && Near(PixelAt(doc, 0, new Point(.2, .85)), Blue), "shapes and ink are drawn");
+        Check(square.CanMove && square.CanResize && ink.CanMove && !ink.CanResize && !underline.CanMove && underline.CanRecolor, "editing capabilities by type");
+
+        doc.MoveAnnotation(square, new Vector(.1, .05));
+        var moved = doc.GetComments(0).Single(c => c.Type == AnnotationType.Square);
+        Check(Near(moved.Bounds, new Rect(.3, .45, .3, .15)) && !Near(PixelAt(doc, 0, LeftEdge(square.Bounds)), Red) && Near(PixelAt(doc, 0, LeftEdge(moved.Bounds)), Red),
+            "moving a shape moves its rectangle and its picture");
+        Throws<InvalidOperationException>(() => doc.SetAnnotationColor(square, Blue), "an outdated annotation is rejected");
+        doc.MoveAnnotation(ink, new Vector(0, -.1));
+        var movedInk = doc.GetComments(0).Single(c => c.Type == AnnotationType.Ink);
+        Check(Near(movedInk.Bounds, new Rect(ink.Bounds.X, ink.Bounds.Y - .1, ink.Bounds.Width, ink.Bounds.Height)) && Near(PixelAt(doc, 0, new Point(.2, .75)), Blue),
+            "moving a drawing moves its strokes");
+        Throws<NotSupportedException>(() => doc.MoveAnnotation(underline, new Vector(.1, 0)), "text markup stays attached to its text");
+
+        doc.ResizeAnnotation(circle, new Rect(.5, .25, .4, .1));
+        Check(Near(doc.GetComments(0).Single(c => c.Type == AnnotationType.Circle).Bounds, new Rect(.5, .25, .4, .1)), "resize a shape");
+        doc.SetAnnotationColor(moved, Green);
+        var green = doc.GetComments(0).Single(c => c.Type == AnnotationType.Square);
+        Check(green.Color == Green && Near(PixelAt(doc, 0, LeftEdge(green.Bounds)), Green), "recolour regenerates the appearance");
+        var note = doc.GetComments(0).Single(c => c.Type == AnnotationType.Note);
+        Check(note.CanMove && !note.CanRecolor, "notes are movable, their icon colour is fixed");
+        doc.MoveAnnotation(note, new Vector(-.1, 0));
+        doc.SetAnnotationText(doc.GetComments(0).Single(c => c.Type == AnnotationType.Ink), "Подпись руководителя");
+        Check(doc.GetComments(0).Single(c => c.Type == AnnotationType.Ink).Text == "Подпись руководителя", "edit annotation comment");
+
+        doc.Undo();
+        doc.Undo();
+        doc.Undo();
+        Check(Near(doc.GetComments(0).Single(c => c.Type == AnnotationType.Square).Bounds, moved.Bounds) && doc.GetComments(0).Single(c => c.Type == AnnotationType.Square).Color == Red,
+            "annotation edits are undone step by step");
+        doc.Redo();
+        doc.Redo();
+        doc.Redo();
+
+        var path = Path.Combine(output, "annotations.pdf");
+        doc.Save(path);
+        using var reopened = PdfDocument.Open(path);
+        var saved = reopened.GetComments(0);
+        Check(saved.Count == 6 && saved.Single(c => c.Type == AnnotationType.Square).Color == Green && Near(PixelAt(reopened, 0, LeftEdge(green.Bounds)), Green),
+            "edited annotations and their appearance survive saving");
+        SaveImage(reopened.Render(0, 794), Path.Combine(output, "annotations-page.png"));
+        var last = saved[^1];
+        reopened.DeleteComment(last);
+        Check(reopened.GetComments(0).Count == 5, "delete edited annotation");
+    }
+
     private static void TestRecovery(string output)
     {
         var directory = Path.Combine(output, "recovery-unit");
@@ -485,6 +571,32 @@ internal static class Program
         Check(!workspace.Document!.IsDirty && workspace.Comments.Count == 0, "undo restores the clean document");
         UntilComplete(workspace.AutosaveAsync());
         Check(Directory.GetFiles(recoveryDirectory, "*.pdf").Length == 0, "recovery copy removed once the document is clean");
+
+        // Annotation workflow through the view model: draw, select, move, recolour, delete.
+        workspace.CurrentPage = 1;
+        Pump(300);
+        workspace.Tool = DocumentTool.Rectangle;
+        workspace.StrokeWidth = 4;
+        UntilComplete(workspace.AddShapeAsync(0, new Rect(.15, .3, .3, .12)));
+        var drawn = workspace.Comments.Single(c => c.Type == AnnotationType.Square);
+        Check(drawn.Color == workspace.CurrentColor, "new shape uses the tool colour");
+        workspace.Tool = DocumentTool.Select;
+        Check(workspace.HitAnnotation(0, new Point(.3, .36), new Size(.005, .005), movableOnly: true) == drawn, "click finds the annotation under the pointer");
+        workspace.SelectedAnnotation = drawn;
+        UntilComplete(workspace.MoveAnnotationAsync(drawn, new Vector(.2, .1)));
+        Check(workspace.SelectedAnnotation is { Type: AnnotationType.Square } kept && Near(kept.Bounds, new Rect(.35, .4, .3, .12)), "selection follows the moved annotation");
+        workspace.CurrentColor = WorkspaceViewModel.Palette[2];
+        UntilComplete(Task.Run(async () => { while (workspace.IsBusy) await Task.Delay(20); }));
+        Pump(200);
+        Check(workspace.SelectedAnnotation?.Color == WorkspaceViewModel.Palette[2] && workspace.CurrentColor == WorkspaceViewModel.Palette[2], "palette recolours the selected annotation");
+        Pump(600);
+        SaveWindow(window, Path.Combine(output, "annotation-selected.png"));
+        workspace.DeleteAnnotationCommand.Execute(null);
+        UntilComplete(Task.Run(async () => { while (workspace.IsBusy) await Task.Delay(20); }));
+        Pump(200);
+        Check(workspace.SelectedAnnotation is null && workspace.Comments.All(c => c.Type != AnnotationType.Square), "delete the selected annotation");
+        while (workspace.Document!.IsDirty) UntilComplete(workspace.ChangeAsync(d => d.Undo()));
+        Check(workspace.Comments.Count == 0, "annotation workflow is fully undoable");
 
         // High zoom renders a sharp region of the visible part instead of a huge bitmap.
         workspace.ZoomPercent = 400;

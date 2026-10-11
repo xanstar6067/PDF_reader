@@ -24,7 +24,9 @@ public sealed class PdfPageControl : FrameworkElement
         new FrameworkPropertyMetadata(null, FrameworkPropertyMetadataOptions.AffectsRender));
     public static readonly DependencyProperty MatchesVersionProperty = DependencyProperty.Register(nameof(MatchesVersion), typeof(int), typeof(PdfPageControl),
         new FrameworkPropertyMetadata(0, FrameworkPropertyMetadataOptions.AffectsRender));
-    public static readonly DependencyProperty WorkspaceProperty = DependencyProperty.Register(nameof(Workspace), typeof(WorkspaceViewModel), typeof(PdfPageControl));
+    public static readonly DependencyProperty SelectedAnnotationProperty = DependencyProperty.Register(nameof(SelectedAnnotation), typeof(PdfComment), typeof(PdfPageControl),
+        new FrameworkPropertyMetadata(null, FrameworkPropertyMetadataOptions.AffectsRender));
+    public static readonly DependencyProperty WorkspaceProperty =DependencyProperty.Register(nameof(Workspace), typeof(WorkspaceViewModel), typeof(PdfPageControl));
     public static readonly DependencyProperty ThumbnailProperty = DependencyProperty.Register(nameof(Thumbnail), typeof(bool), typeof(PdfPageControl),
         new FrameworkPropertyMetadata(false, ItemChanged));
 
@@ -32,6 +34,7 @@ public sealed class PdfPageControl : FrameworkElement
     public int Version { get => (int)GetValue(VersionProperty); set => SetValue(VersionProperty, value); }
     public SearchMatch? Match { get => (SearchMatch?)GetValue(MatchProperty); set => SetValue(MatchProperty, value); }
     public int MatchesVersion { get => (int)GetValue(MatchesVersionProperty); set => SetValue(MatchesVersionProperty, value); }
+    public PdfComment? SelectedAnnotation { get => (PdfComment?)GetValue(SelectedAnnotationProperty); set => SetValue(SelectedAnnotationProperty, value); }
     public WorkspaceViewModel? Workspace { get => (WorkspaceViewModel?)GetValue(WorkspaceProperty); set => SetValue(WorkspaceProperty, value); }
     public bool Thumbnail { get => (bool)GetValue(ThumbnailProperty); set => SetValue(ThumbnailProperty, value); }
 
@@ -42,6 +45,11 @@ public sealed class PdfPageControl : FrameworkElement
     private static readonly Brush SelectionBrush = FrozenBrush(Color.FromArgb(85, 46, 117, 224));
     private static readonly Brush MatchBrush = FrozenBrush(Color.FromArgb(80, 255, 214, 64));
     private static readonly Brush CurrentMatchBrush = FrozenBrush(Color.FromArgb(150, 255, 150, 20));
+    private static readonly Pen SelectionPen = FrozenPen(new Pen(FrozenBrush(Color.FromRgb(46, 117, 224)), 1.25) { DashStyle = DashStyles.Dash });
+    private static readonly Pen HandlePen = FrozenPen(new Pen(FrozenBrush(Color.FromRgb(46, 117, 224)), 1.25));
+    private const double HandleSize = 8;
+
+    private enum Drag { None, Text, Shape, Ink, Move, Resize }
 
     private BitmapSource? _image;
     private (int Width, int Version) _imageKey;
@@ -55,12 +63,22 @@ public sealed class PdfPageControl : FrameworkElement
     private Point? _anchor;
     private Point _dragPoint;
     private TextSelection? _selection;
+    private Drag _drag;
+    private PdfComment? _dragAnnotation;
+    private Point _resizeFixed;
+    private readonly List<Point> _ink = [];
 
     private static Brush FrozenBrush(Color color)
     {
         var brush = new SolidColorBrush(color);
         brush.Freeze();
         return brush;
+    }
+
+    private static Pen FrozenPen(Pen pen)
+    {
+        pen.Freeze();
+        return pen;
     }
 
     public PdfPageControl()
@@ -126,6 +144,8 @@ public sealed class PdfPageControl : FrameworkElement
         view._detail = null;
         view._selection = null;
         view._error = null;
+        view._anchor = null;
+        view._drag = Drag.None;
         view.InvalidateVisual();
         view.RenderPage();
     }
@@ -275,48 +295,175 @@ public sealed class PdfPageControl : FrameworkElement
         if (Thumbnail) return;
         var (width, height) = DeviceSize();
         if (_detail is not null && _detailKey.Width == width && _detailKey.Height == height) dc.DrawImage(_detail, _detailRect);
-        if (Item is { } item && Workspace is { } vm)
+        if (Item is not { } item || Workspace is not { } vm) return;
+        foreach (var match in vm.GetPageMatches(item.Info.Index))
         {
-            foreach (var match in vm.GetPageMatches(item.Info.Index))
-            {
-                var brush = match == Match ? CurrentMatchBrush : MatchBrush;
-                foreach (var rect in match.Rectangles) dc.DrawRectangle(brush, null, DisplayRect(rect));
-            }
+            var brush = match == Match ? CurrentMatchBrush : MatchBrush;
+            foreach (var rect in match.Rectangles) dc.DrawRectangle(brush, null, DisplayRect(rect));
         }
         if (_selection is { } selection)
             foreach (var rect in selection.Rectangles) dc.DrawRectangle(SelectionBrush, null, DisplayRect(rect));
-        if (_anchor is { } anchor) dc.DrawRectangle(SelectionBrush, new Pen(Brushes.SteelBlue, .75), new Rect(anchor, _dragPoint));
+        if (SelectedAnnotation is { } selected && selected.PageIndex == item.Info.Index && _drag is not (Drag.Move or Drag.Resize))
+            DrawSelection(dc, DisplayRect(selected.Bounds), selected.CanResize);
+        if (_anchor is not { } anchor) return;
+        switch (_drag)
+        {
+            case Drag.Move when _dragAnnotation is { } moving:
+                var moved = DisplayRect(moving.Bounds);
+                var offset = ClampOffset(moving.Bounds, _dragPoint - anchor);
+                moved.Offset(offset.X * ActualWidth, offset.Y * ActualHeight);
+                DrawSelection(dc, moved, false);
+                break;
+            case Drag.Resize:
+                DrawSelection(dc, new Rect(_resizeFixed, Clamp(_dragPoint)), true);
+                break;
+            case Drag.Shape:
+                var shape = new Rect(anchor, Clamp(_dragPoint));
+                var pen = ShapePen(vm);
+                if (vm.Tool == DocumentTool.Ellipse) dc.DrawEllipse(null, pen, new Point(shape.X + shape.Width / 2, shape.Y + shape.Height / 2), shape.Width / 2, shape.Height / 2);
+                else dc.DrawRectangle(null, pen, shape);
+                break;
+            case Drag.Ink when _ink.Count > 1:
+                var geometry = new StreamGeometry();
+                using (var context = geometry.Open())
+                {
+                    context.BeginFigure(_ink[0], false, false);
+                    context.PolyLineTo(_ink.Skip(1).ToList(), true, true);
+                }
+                dc.DrawGeometry(null, ShapePen(vm), geometry);
+                break;
+            case Drag.Text:
+                dc.DrawRectangle(SelectionBrush, new Pen(Brushes.SteelBlue, .75), new Rect(anchor, _dragPoint));
+                break;
+        }
+    }
+
+    private Pen ShapePen(WorkspaceViewModel vm)
+    {
+        // Line width is in PDF points; the page is drawn at ActualWidth for Info.Width points.
+        var scale = Item is { } item ? ActualWidth / item.Info.Width : 1;
+        return new Pen(new SolidColorBrush(vm.CurrentColor), Math.Max(1, vm.StrokeWidth * scale)) { StartLineCap = PenLineCap.Round, EndLineCap = PenLineCap.Round, LineJoin = PenLineJoin.Round };
+    }
+
+    private static void DrawSelection(DrawingContext dc, Rect rect, bool handles)
+    {
+        rect.Inflate(3, 3);
+        dc.DrawRectangle(null, SelectionPen, rect);
+        if (!handles) return;
+        foreach (var corner in new[] { rect.TopLeft, rect.TopRight, rect.BottomRight, rect.BottomLeft })
+            dc.DrawRectangle(Brushes.White, HandlePen, new Rect(corner.X - HandleSize / 2, corner.Y - HandleSize / 2, HandleSize, HandleSize));
     }
 
     private Rect DisplayRect(Rect rect) => new(rect.X * ActualWidth, rect.Y * ActualHeight, rect.Width * ActualWidth, rect.Height * ActualHeight);
 
     private Point Normalize(Point point) => new(Math.Clamp(point.X / ActualWidth, 0, 1), Math.Clamp(point.Y / ActualHeight, 0, 1));
 
+    private Point Clamp(Point point) => new(Math.Clamp(point.X, 0, ActualWidth), Math.Clamp(point.Y, 0, ActualHeight));
+
+    // Hit tolerance of a few pixels around thin annotations, in normalized coordinates.
+    private Size Tolerance => new(4 / Math.Max(1, ActualWidth), 4 / Math.Max(1, ActualHeight));
+
+    /// <summary>Normalized offset for a drag, limited so the annotation stays on the page.</summary>
+    private Vector ClampOffset(Rect bounds, Vector drag)
+    {
+        var dx = drag.X / ActualWidth;
+        var dy = drag.Y / ActualHeight;
+        return new(Math.Clamp(dx, Math.Min(0, -bounds.Left), Math.Max(0, 1 - bounds.Right)), Math.Clamp(dy, Math.Min(0, -bounds.Top), Math.Max(0, 1 - bounds.Bottom)));
+    }
+
+    /// <summary>Opposite corner of the resize handle under <paramref name="point"/>, if any.</summary>
+    private Point? ResizeAnchorAt(PdfComment annotation, Point point)
+    {
+        // Handles are drawn around the annotation; the fixed corner is the annotation's own corner, so resizing does not drift.
+        var rect = DisplayRect(annotation.Bounds);
+        var corners = new[] { rect.TopLeft, rect.TopRight, rect.BottomRight, rect.BottomLeft };
+        rect.Inflate(3, 3);
+        var handles = new[] { rect.TopLeft, rect.TopRight, rect.BottomRight, rect.BottomLeft };
+        for (var i = 0; i < 4; i++)
+            if ((handles[i] - point).Length <= HandleSize) return corners[(i + 2) % 4];
+        return null;
+    }
+
     protected override void OnMouseLeftButtonDown(MouseButtonEventArgs e)
     {
         base.OnMouseLeftButtonDown(e);
-        if (Thumbnail || Workspace?.CanInteract != true) return;
+        if (Thumbnail || Workspace is not { CanInteract: true } vm || Item is not { } item) return;
         Focus();
+        e.Handled = true;
+        var position = e.GetPosition(this);
+        var point = Normalize(position);
+        var index = item.Info.Index;
+        // Make this the current page first, so selecting an annotation does not scroll the view.
+        vm.SetVisiblePage(index);
         _selection = null;
-        _anchor = e.GetPosition(this);
-        _dragPoint = _anchor.Value;
+        _drag = Drag.Text;
+        if (vm.Tool == DocumentTool.Select)
+        {
+            if (e.ClickCount == 2 && vm.HitAnnotation(index, point, Tolerance) is { } clicked)
+            {
+                vm.SelectedAnnotation = clicked;
+                vm.EditAnnotationTextCommand.Execute(null);
+                return;
+            }
+            if (vm.SelectedAnnotation is { CanResize: true } selected && selected.PageIndex == index && ResizeAnchorAt(selected, position) is { } fixedCorner)
+            {
+                _drag = Drag.Resize;
+                _dragAnnotation = selected;
+                _resizeFixed = fixedCorner;
+            }
+            else if (vm.HitAnnotation(index, point, Tolerance, movableOnly: true) is { } movable)
+            {
+                vm.SelectedAnnotation = movable;
+                _drag = Drag.Move;
+                _dragAnnotation = movable;
+            }
+            else vm.SelectedAnnotation = null;
+        }
+        else if (vm.Tool is DocumentTool.Rectangle or DocumentTool.Ellipse) _drag = Drag.Shape;
+        else if (vm.Tool == DocumentTool.Ink)
+        {
+            _drag = Drag.Ink;
+            _ink.Clear();
+            _ink.Add(position);
+        }
+        _anchor = position;
+        _dragPoint = position;
         CaptureMouse();
         InvalidateVisual();
-        e.Handled = true;
     }
 
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
-        Cursor = Workspace?.Tool switch
+        var position = e.GetPosition(this);
+        if (_anchor is null || e.LeftButton != MouseButtonState.Pressed)
         {
-            DocumentTool.EditText or DocumentTool.AddText => Cursors.IBeam,
-            DocumentTool.Note => Cursors.Pen,
-            _ => Cursors.Arrow
-        };
-        if (_anchor is null || e.LeftButton != MouseButtonState.Pressed) return;
-        _dragPoint = e.GetPosition(this);
+            Cursor = HoverCursor(position);
+            return;
+        }
+        _dragPoint = position;
+        if (_drag == Drag.Ink && (_ink[^1] - position).Length >= 1.5 && _ink.Count < 20000) _ink.Add(Clamp(position));
         InvalidateVisual();
+    }
+
+    private Cursor HoverCursor(Point position)
+    {
+        if (Thumbnail || Workspace is not { } vm || Item is not { } item) return Cursors.Arrow;
+        switch (vm.Tool)
+        {
+            case DocumentTool.EditText or DocumentTool.AddText:
+                return Cursors.IBeam;
+            case DocumentTool.Note or DocumentTool.Ink:
+                return Cursors.Pen;
+            case DocumentTool.Rectangle or DocumentTool.Ellipse:
+                return Cursors.Cross;
+            case DocumentTool.Select:
+                if (vm.SelectedAnnotation is { CanResize: true } selected && selected.PageIndex == item.Info.Index && ResizeAnchorAt(selected, position) is { } opposite)
+                    return (opposite.X < position.X) == (opposite.Y < position.Y) ? Cursors.SizeNWSE : Cursors.SizeNESW;
+                return vm.HitAnnotation(item.Info.Index, Normalize(position), Tolerance, movableOnly: true) is not null ? Cursors.SizeAll : Cursors.Arrow;
+            default:
+                return Cursors.Arrow;
+        }
     }
 
     protected override async void OnMouseLeftButtonUp(MouseButtonEventArgs e)
@@ -327,25 +474,52 @@ public sealed class PdfPageControl : FrameworkElement
         var startNormalized = Normalize(anchor);
         var endNormalized = Normalize(end);
         var dragged = (anchor - end).Length > 4;
+        var drag = _drag;
+        var annotation = _dragAnnotation;
+        var ink = _ink.Select(Normalize).ToList();
+        var resizeFixed = _resizeFixed;
         _anchor = null;
+        _drag = Drag.None;
+        _dragAnnotation = null;
+        _ink.Clear();
         ReleaseMouseCapture();
         InvalidateVisual();
         e.Handled = true;
         if (!vm.CanInteract || vm.Document != item.Document) return;
-        vm.SetVisiblePage(item.Info.Index);
+        var index = item.Info.Index;
+        vm.SetVisiblePage(index);
         try
         {
+            switch (drag)
+            {
+                case Drag.Move when dragged && annotation is not null:
+                    await vm.MoveAnnotationAsync(annotation, ClampOffset(annotation.Bounds, end - anchor));
+                    return;
+                case Drag.Resize when dragged && annotation is not null:
+                    var resized = new Rect(Normalize(resizeFixed), endNormalized);
+                    if (resized.Width * ActualWidth >= 6 && resized.Height * ActualHeight >= 6) await vm.ResizeAnnotationAsync(annotation, resized);
+                    return;
+                case Drag.Move or Drag.Resize:
+                    return;
+                case Drag.Shape:
+                    var shape = new Rect(startNormalized, endNormalized);
+                    if (shape.Width * ActualWidth >= 4 && shape.Height * ActualHeight >= 4) await vm.AddShapeAsync(index, shape);
+                    return;
+                case Drag.Ink:
+                    if (dragged && ink.Count > 1) await vm.AddInkAsync(index, ink);
+                    return;
+            }
             if (vm.Tool is DocumentTool.EditText or DocumentTool.AddText or DocumentTool.Note)
             {
-                await vm.EditAtAsync(item.Info.Index, startNormalized);
+                await vm.EditAtAsync(index, startNormalized);
             }
             else if (dragged)
             {
-                var selection = await Task.Run(() => item.Document.SelectText(item.Info.Index, startNormalized, endNormalized));
+                var selection = await Task.Run(() => item.Document.SelectText(index, startNormalized, endNormalized));
                 if (vm.Document != item.Document || Item != item) return;
-                if (vm.Tool == DocumentTool.Highlight && selection.Rectangles.Count > 0)
+                if (vm.Tool is DocumentTool.Highlight or DocumentTool.Underline or DocumentTool.StrikeOut && selection.Rectangles.Count > 0)
                 {
-                    await vm.HighlightAsync(item.Info.Index, selection.Rectangles);
+                    await vm.AddTextMarkupAsync(index, selection.Rectangles);
                 }
                 else
                 {
@@ -356,8 +530,14 @@ public sealed class PdfPageControl : FrameworkElement
             }
             else if (vm.Tool == DocumentTool.Select)
             {
-                if (await vm.TryFillFormAtAsync(item.Info.Index, startNormalized)) return;
-                var link = await Task.Run(() => item.Document.HitLink(item.Info.Index, startNormalized));
+                if (vm.HitAnnotation(index, startNormalized, Tolerance) is { } hit)
+                {
+                    vm.SelectedAnnotation = hit;
+                    vm.Status = "Аннотация выделена • Delete — удалить • двойной щелчок — комментарий";
+                    return;
+                }
+                if (await vm.TryFillFormAtAsync(index, startNormalized)) return;
+                var link = await Task.Run(() => item.Document.HitLink(index, startNormalized));
                 if (link is not null && vm.Document == item.Document) vm.OpenLink(link);
             }
         }
@@ -369,7 +549,11 @@ public sealed class PdfPageControl : FrameworkElement
 
     protected override void OnLostMouseCapture(MouseEventArgs e)
     {
+        // A lost capture (another window, Alt+Tab) cancels the gesture; a normal release has already consumed it.
         _anchor = null;
+        _drag = Drag.None;
+        _dragAnnotation = null;
+        _ink.Clear();
         InvalidateVisual();
         base.OnLostMouseCapture(e);
     }

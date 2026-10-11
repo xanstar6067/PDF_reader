@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Windows;
 using System.Windows.Input;
+using System.Windows.Media;
 using PDF_Reader.Models;
 using PDF_Reader.Services;
 
@@ -20,6 +21,17 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
     private string _status = "Откройте PDF, чтобы начать работу", _query = "";
     private DocumentTool _tool;
     private SearchMatch? _selectedMatch;
+    private PdfComment? _selectedAnnotation;
+    private float _strokeWidth = 2;
+    private readonly Dictionary<DocumentTool, Color> _toolColors = new()
+    {
+        [DocumentTool.Highlight] = PdfDocument.DefaultHighlight,
+        [DocumentTool.Underline] = Color.FromRgb(67, 160, 71),
+        [DocumentTool.StrikeOut] = Color.FromRgb(229, 57, 53),
+        [DocumentTool.Rectangle] = Color.FromRgb(229, 57, 53),
+        [DocumentTool.Ellipse] = Color.FromRgb(229, 57, 53),
+        [DocumentTool.Ink] = Color.FromRgb(30, 136, 229)
+    };
     private CancellationTokenSource? _searchCancellation;
     private Dictionary<int, List<SearchMatch>> _pageMatches = [];
 
@@ -132,7 +144,9 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
         set
         {
             if (!Set(ref _tool, value)) return;
+            if (value != DocumentTool.Select) SelectedAnnotation = null;
             Notify(nameof(ToolHint));
+            Notify(nameof(CurrentColor));
             Status = ToolHint;
         }
     }
@@ -142,9 +156,61 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
         DocumentTool.EditText => "Нажмите на текстовый фрагмент, чтобы изменить его",
         DocumentTool.AddText => "Нажмите на страницу, чтобы добавить текст",
         DocumentTool.Highlight => "Протяните мышью по тексту, чтобы выделить его маркером",
+        DocumentTool.Underline => "Протяните мышью по тексту, чтобы подчеркнуть его",
+        DocumentTool.StrikeOut => "Протяните мышью по тексту, чтобы зачеркнуть его",
         DocumentTool.Note => "Нажмите на страницу, чтобы оставить заметку",
-        _ => "Выделяйте текст мышью • Ctrl+C — копировать • Ctrl+колесо — масштаб"
+        DocumentTool.Rectangle => "Протяните мышью, чтобы нарисовать прямоугольник",
+        DocumentTool.Ellipse => "Протяните мышью, чтобы нарисовать овал",
+        DocumentTool.Ink => "Рисуйте мышью с нажатой кнопкой",
+        _ => "Выделяйте текст мышью • щелчок по аннотации выделяет её • Delete — удалить • Ctrl+колесо — масштаб"
     };
+
+    public static IReadOnlyList<Color> Palette { get; } =
+    [
+        PdfDocument.DefaultHighlight, Color.FromRgb(67, 160, 71), Color.FromRgb(30, 136, 229),
+        Color.FromRgb(229, 57, 53), Color.FromRgb(142, 36, 170), Color.FromRgb(33, 33, 33)
+    ];
+
+    public static IReadOnlyList<float> StrokeWidths { get; } = [1f, 2f, 4f];
+
+    /// <summary>Line width in points for new rectangles, ellipses and drawings.</summary>
+    public float StrokeWidth { get => _strokeWidth; set => Set(ref _strokeWidth, value); }
+
+    /// <summary>Colour of the selected annotation, or of new annotations made with the current tool.</summary>
+    public Color CurrentColor
+    {
+        get => SelectedAnnotation is { CanRecolor: true } annotation ? annotation.Color : _toolColors.GetValueOrDefault(Tool, Palette[3]);
+        set
+        {
+            if (SelectedAnnotation is { CanRecolor: true } annotation)
+            {
+                // The panel updates once the document has the new colour.
+                if (annotation.Color != value) RecolorAsync(annotation, value);
+                return;
+            }
+            _toolColors[Tool] = value;
+            Notify();
+        }
+    }
+
+    public PdfComment? SelectedAnnotation
+    {
+        get => _selectedAnnotation;
+        set
+        {
+            if (!Set(ref _selectedAnnotation, value)) return;
+            Notify(nameof(HasSelectedAnnotation));
+            Notify(nameof(SelectedAnnotationSummary));
+            Notify(nameof(CurrentColor));
+            CommandManager.InvalidateRequerySuggested();
+        }
+    }
+
+    public bool HasSelectedAnnotation => SelectedAnnotation is not null;
+
+    public string SelectedAnnotationSummary => SelectedAnnotation is { } a
+        ? $"{a.Kind}, стр. {a.PageNumber}" + (a.CanMove ? " • перетаскивайте мышью" : "")
+        : "";
 
     public PrintScaling PrintScaling
     {
@@ -218,6 +284,8 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
     public ICommand ImportCommand { get; }
     public ICommand ExportCommand { get; }
     public ICommand CopyPageTextCommand { get; }
+    public ICommand DeleteAnnotationCommand { get; }
+    public ICommand EditAnnotationTextCommand { get; }
     public ICommand PropertiesCommand { get; }
     public ICommand DefaultAppCommand { get; }
 
@@ -264,6 +332,10 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
         ImportCommand = Async(ImportAsync, CanAssemble);
         ExportCommand = Async(ExportAsync, () => CanInteract && Info?.CanCopy == true);
         CopyPageTextCommand = Async(CopyPageTextAsync, () => CanInteract && Info?.CanCopy == true);
+        bool CanAnnotate() => CanInteract && Info?.CanAnnotate == true;
+        DeleteAnnotationCommand = Async(() => SelectedAnnotation is { } a ? DeleteCommentAsync(a) : Task.CompletedTask,
+            () => CanAnnotate() && SelectedAnnotation is not null);
+        EditAnnotationTextCommand = Async(EditAnnotationTextAsync, () => CanAnnotate() && SelectedAnnotation?.CanEditText == true);
         PropertiesCommand = new RelayCommand(ShowProperties, Available);
         DefaultAppCommand = new RelayCommand(() => DefaultAppRequested?.Invoke(), () => !IsBusy);
     }
@@ -296,6 +368,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
         CancelSearch();
         _tool = DocumentTool.Select;
         Notify(nameof(Tool));
+        Notify(nameof(CurrentColor));
         try
         {
             await BusyAsync("Загрузка документа…", () => RefreshAsync());
@@ -318,6 +391,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
         var document = Document;
         var data = document is null ? null : await Task.Run(() => new WorkspaceData(document.GetInfo(), document.GetPages(),
             changedPage is null ? document.GetOutline() : null, document.GetComments(changedPage)));
+        var selected = SelectedAnnotation;
         SetMatches([]);
         Info = data?.Info;
         if (document is not null && data is not null)
@@ -334,6 +408,10 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
                 Comments.Clear();
                 foreach (var comment in data.Comments) Comments.Add(comment);
             }
+            // An edit of the selected annotation keeps it selected with its new geometry and colour.
+            SelectedAnnotation = selected is null || changedPage is null ? null
+                : changedPage != selected.PageIndex ? selected
+                : Comments.FirstOrDefault(c => c.PageIndex == selected.PageIndex && c.AnnotationIndex == selected.AnnotationIndex);
             _currentPage = Math.Clamp(ActiveTab!.LastPage, 1, PageCount);
             ActiveTab.Refresh();
             if (_fitWidth) FitWidth();
@@ -344,6 +422,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
             Pages.Clear();
             Outline.Clear();
             Comments.Clear();
+            SelectedAnnotation = null;
             _currentPage = 1;
             Status = "Откройте PDF, чтобы начать работу";
         }
@@ -611,7 +690,75 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
         }
     }
 
-    public Task HighlightAsync(int index, IReadOnlyList<Rect> rectangles) => ChangeAsync(d => d.Highlight(index, rectangles), index);
+    // Annotations --------------------------------------------------------------------------------
+
+    /// <summary>Highlight, underline or strike-out (by the current tool) over text rectangles.</summary>
+    public Task AddTextMarkupAsync(int index, IReadOnlyList<Rect> rectangles)
+    {
+        var type = Tool switch
+        {
+            DocumentTool.Underline => AnnotationType.Underline,
+            DocumentTool.StrikeOut => AnnotationType.StrikeOut,
+            _ => AnnotationType.Highlight
+        };
+        var color = CurrentColor;
+        return ChangeAsync(d => d.AddTextMarkup(index, rectangles, type, color), index);
+    }
+
+    public Task AddShapeAsync(int index, Rect bounds)
+    {
+        var type = Tool == DocumentTool.Ellipse ? AnnotationType.Circle : AnnotationType.Square;
+        var (color, width) = (CurrentColor, StrokeWidth);
+        return ChangeAsync(d => d.AddShape(index, bounds, type, color, width), index);
+    }
+
+    public Task AddInkAsync(int index, IReadOnlyList<Point> points)
+    {
+        var (color, width) = (CurrentColor, StrokeWidth);
+        return ChangeAsync(d => d.AddInk(index, points, color, width), index);
+    }
+
+    public Task MoveAnnotationAsync(PdfComment annotation, Vector offset) =>
+        ChangeAsync(d => d.MoveAnnotation(annotation, offset), annotation.PageIndex);
+
+    public Task ResizeAnnotationAsync(PdfComment annotation, Rect bounds) =>
+        ChangeAsync(d => d.ResizeAnnotation(annotation, bounds), annotation.PageIndex);
+
+    private async void RecolorAsync(PdfComment annotation, Color color)
+    {
+        try
+        {
+            await ChangeAsync(d => d.SetAnnotationColor(annotation, color), annotation.PageIndex);
+        }
+        catch (Exception ex)
+        {
+            ShowError(ex);
+        }
+        Notify(nameof(CurrentColor));
+    }
+
+    public async Task EditAnnotationTextAsync()
+    {
+        if (SelectedAnnotation is not { CanEditText: true } annotation) return;
+        var text = _dialogs.AskText("Комментарий", $"{annotation.Kind}, страница {annotation.PageNumber}. Текст сохраняется в PDF и виден в других программах.",
+            annotation.Text, multiline: true);
+        if (text is null || text == annotation.Text) return;
+        await ChangeAsync(d => d.SetAnnotationText(annotation, text), annotation.PageIndex);
+    }
+
+    /// <summary>Topmost annotation under a point of a page; <paramref name="tolerance"/> widens thin shapes.</summary>
+    public PdfComment? HitAnnotation(int index, Point point, Size tolerance, bool movableOnly = false)
+    {
+        PdfComment? hit = null;
+        foreach (var comment in Comments)
+        {
+            if (comment.PageIndex != index || movableOnly && !comment.CanMove) continue;
+            var bounds = comment.Bounds;
+            bounds.Inflate(tolerance);
+            if (bounds.Contains(point)) hit = comment; // Later annotations are drawn on top.
+        }
+        return hit;
+    }
 
     public async Task<bool> TryFillFormAtAsync(int index, Point point)
     {
@@ -654,8 +801,11 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
 
     public async Task DeleteCommentAsync(PdfComment comment)
     {
-        if (CanInteract && _dialogs.Confirm("Удалить аннотацию", "Удалить выбранную аннотацию?"))
-            await ChangeAsync(d => d.DeleteComment(comment), comment.PageIndex);
+        if (!CanInteract) return;
+        // Indexes after the removed annotation shift, so the selection must not be re-resolved by index.
+        if (SelectedAnnotation?.PageIndex == comment.PageIndex) SelectedAnnotation = null;
+        await ChangeAsync(d => d.DeleteComment(comment), comment.PageIndex);
+        Status = "Аннотация удалена • Ctrl+Z — отменить";
     }
 
     private void SetMatches(IReadOnlyList<SearchMatch> matches)

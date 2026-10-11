@@ -937,49 +937,273 @@ public sealed class PdfDocument : IDisposable
         }
     }
 
-    public void AddNote(int index, Point point, string content) => AddAnnotation(index, [new Rect(point, new Size(.025, .025))], content, 1);
+    // Annotations ---------------------------------------------------------------------------------
 
-    public void Highlight(int index, IReadOnlyList<Rect> rectangles) => AddAnnotation(index, rectangles, "", 9);
+    public static readonly Color DefaultHighlight = Color.FromRgb(255, 202, 40);
+    private const uint HighlightAlpha = 110;
 
-    private void AddAnnotation(int index, IReadOnlyList<Rect> rectangles, string content, int type)
+    // PDFium draws the note icon in yellow regardless of /C, so notes keep the standard colour.
+    public void AddNote(int index, Point point, string content) => AddAnnotation(index, AnnotationType.Note, DefaultHighlight, 0, content, (page, annot) =>
+        SetRect(annot, ToPdfRect(page, new Rect(point, new Size(.025, .025)))));
+
+    public void Highlight(int index, IReadOnlyList<Rect> rectangles) => AddTextMarkup(index, rectangles, AnnotationType.Highlight, DefaultHighlight);
+
+    /// <summary>Highlight, underline, squiggly or strike-out over text rectangles (normalized display coordinates).</summary>
+    public void AddTextMarkup(int index, IReadOnlyList<Rect> rectangles, int type, Color color)
     {
+        if (type is not (AnnotationType.Highlight or AnnotationType.Underline or AnnotationType.Squiggly or AnnotationType.StrikeOut))
+            throw new ArgumentOutOfRangeException(nameof(type));
         if (rectangles.Count == 0) return;
+        AddAnnotation(index, type, color, 0, "", (page, annot) =>
+        {
+            var bounds = Rect.Empty;
+            foreach (var rect in rectangles)
+            {
+                var tl = ToPdf(page, rect.TopLeft);
+                var tr = ToPdf(page, rect.TopRight);
+                var bl = ToPdf(page, rect.BottomLeft);
+                var br = ToPdf(page, rect.BottomRight);
+                foreach (var pt in new[] { tl, tr, bl, br }) bounds.Union(pt);
+                var quad = new Pdfium.Quad
+                {
+                    X1 = (float)tl.X, Y1 = (float)tl.Y, X2 = (float)tr.X, Y2 = (float)tr.Y,
+                    X3 = (float)bl.X, Y3 = (float)bl.Y, X4 = (float)br.X, Y4 = (float)br.Y
+                };
+                if (Pdfium.FPDFAnnot_AppendAttachmentPoints(annot, ref quad) == 0) throw new InvalidOperationException("Не удалось выделить текст.");
+            }
+            SetRect(annot, new Pdfium.RectF { Left = (float)bounds.Left, Right = (float)bounds.Right, Top = (float)bounds.Bottom, Bottom = (float)bounds.Top });
+        });
+    }
+
+    /// <summary>Rectangle or ellipse inscribed in <paramref name="bounds"/> (normalized display coordinates).</summary>
+    public void AddShape(int index, Rect bounds, int type, Color color, float width)
+    {
+        if (type is not (AnnotationType.Square or AnnotationType.Circle)) throw new ArgumentOutOfRangeException(nameof(type));
+        AddAnnotation(index, type, color, width, "", (page, annot) =>
+        {
+            var rect = ToPdfRect(page, bounds);
+            if (rect.Right - rect.Left < 2 || rect.Top - rect.Bottom < 2) throw new ArgumentException("Фигура слишком маленькая.");
+            SetRect(annot, rect);
+        });
+    }
+
+    /// <summary>Freehand stroke through <paramref name="points"/> (normalized display coordinates).</summary>
+    public void AddInk(int index, IReadOnlyList<Point> points, Color color, float width)
+    {
+        if (points.Count < 2 || points.Count > 20000) throw new ArgumentException("Нарисуйте линию.");
+        AddAnnotation(index, AnnotationType.Ink, color, width, "", (page, annot) =>
+        {
+            var stroke = points.Select(p => ToPdf(page, p)).Select(p => new Pdfium.PointF { X = (float)p.X, Y = (float)p.Y }).ToArray();
+            SetRect(annot, InkBounds([stroke], width));
+            if (Pdfium.FPDFAnnot_AddInkStroke(annot, stroke, (nuint)stroke.Length) < 0) throw new InvalidOperationException("Не удалось сохранить рисунок.");
+        });
+    }
+
+    private void AddAnnotation(int index, int type, Color color, float width, string content, Action<nint, nint> geometry)
+    {
+        if (width is < 0 or > 50 || !float.IsFinite(width)) throw new ArgumentException("Толщина линии должна быть от 0 до 50 пт.");
         Edit(() => OnPage(index, page =>
         {
             var annot = Pdfium.FPDFPage_CreateAnnot(page, type);
             if (annot == 0) throw new InvalidOperationException("Не удалось создать аннотацию.");
             try
             {
-                var bounds = Rect.Empty;
-                foreach (var rect in rectangles)
-                {
-                    var tl = ToPdf(page, rect.TopLeft);
-                    var tr = ToPdf(page, rect.TopRight);
-                    var bl = ToPdf(page, rect.BottomLeft);
-                    var br = ToPdf(page, rect.BottomRight);
-                    foreach (var pt in new[] { tl, tr, bl, br }) bounds.Union(pt);
-                    if (type != 9) continue;
-                    var quad = new Pdfium.Quad
-                    {
-                        X1 = (float)tl.X, Y1 = (float)tl.Y, X2 = (float)tr.X, Y2 = (float)tr.Y,
-                        X3 = (float)bl.X, Y3 = (float)bl.Y, X4 = (float)br.X, Y4 = (float)br.Y
-                    };
-                    if (Pdfium.FPDFAnnot_AppendAttachmentPoints(annot, ref quad) == 0) throw new InvalidOperationException("Не удалось выделить текст.");
-                }
-                var native = new Pdfium.RectF { Left = (float)bounds.Left, Right = (float)bounds.Right, Top = (float)bounds.Bottom, Bottom = (float)bounds.Top };
-                if (Pdfium.FPDFAnnot_SetRect(annot, ref native) == 0 || Pdfium.FPDFAnnot_SetColor(annot, 0, 255, 202, 40, type == 9 ? 110u : 255u) == 0)
-                    throw new InvalidOperationException("Не удалось настроить аннотацию.");
+                geometry(page, annot);
+                SetColor(annot, type, color);
+                if (width > 0) Pdfium.FPDFAnnot_SetBorder(annot, 0, 0, width);
                 Pdfium.FPDFAnnot_SetFlags(annot, 4); // Print with document.
                 Pdfium.FPDFAnnot_SetStringValue(annot, "Contents", content);
                 Pdfium.FPDFAnnot_SetStringValue(annot, "T", Environment.UserName);
-                Pdfium.FPDFAnnot_SetStringValue(annot, "M", "D:" + DateTime.UtcNow.ToString("yyyyMMddHHmmss") + "Z");
+                Touch(annot);
             }
             finally
             {
                 Pdfium.FPDFPage_CloseAnnot(annot);
             }
+            GenerateAppearances(page);
             return 0;
         }), 32);
+    }
+
+    /// <summary>Moves an annotation by <paramref name="offset"/> in normalized display coordinates; its popup follows.</summary>
+    public void MoveAnnotation(PdfComment annotation, Vector offset)
+    {
+        if (!annotation.CanMove) throw new NotSupportedException("Эту аннотацию нельзя перемещать.");
+        EditAnnotation(annotation, (page, annot) =>
+        {
+            var origin = ToPdf(page, new Point(.5, .5));
+            var target = ToPdf(page, new Point(.5 + offset.X, .5 + offset.Y));
+            float dx = (float)(target.X - origin.X), dy = (float)(target.Y - origin.Y);
+            // The appearance stream is mapped onto the rectangle, so shifting the rectangle moves the picture.
+            Shift(annot, dx, dy);
+            if (annotation.Type == AnnotationType.Ink)
+            {
+                var strokes = ReadInk(annot);
+                Pdfium.FPDFAnnot_RemoveInkList(annot);
+                foreach (var stroke in strokes)
+                {
+                    for (var i = 0; i < stroke.Length; i++) stroke[i] = new Pdfium.PointF { X = stroke[i].X + dx, Y = stroke[i].Y + dy };
+                    Pdfium.FPDFAnnot_AddInkStroke(annot, stroke, (nuint)stroke.Length);
+                }
+            }
+            var popup = Pdfium.FPDFAnnot_GetLinkedAnnot(annot, "Popup");
+            if (popup == 0) return;
+            try
+            {
+                Shift(popup, dx, dy);
+            }
+            finally
+            {
+                Pdfium.FPDFPage_CloseAnnot(popup);
+            }
+        });
+    }
+
+    /// <summary>Gives a rectangle or ellipse new bounds (normalized display coordinates).</summary>
+    public void ResizeAnnotation(PdfComment annotation, Rect bounds)
+    {
+        if (!annotation.CanResize) throw new NotSupportedException("Размер этой аннотации нельзя изменить.");
+        EditAnnotation(annotation, (page, annot) =>
+        {
+            var rect = ToPdfRect(page, bounds);
+            if (rect.Right - rect.Left < 2 || rect.Top - rect.Bottom < 2) throw new ArgumentException("Фигура слишком маленькая.");
+            // A new appearance keeps the line width; stretching the old one would distort it.
+            Pdfium.FPDFAnnot_SetAP(annot, 0, null);
+            SetRect(annot, rect);
+        });
+    }
+
+    public void SetAnnotationColor(PdfComment annotation, Color color)
+    {
+        if (!annotation.CanRecolor) throw new NotSupportedException("Цвет этой аннотации нельзя изменить.");
+        EditAnnotation(annotation, (_, annot) =>
+        {
+            // PDFium refuses to recolour an annotation with an appearance stream; it regenerates one afterwards.
+            Pdfium.FPDFAnnot_SetAP(annot, 0, null);
+            SetColor(annot, annotation.Type, color);
+        });
+    }
+
+    public void SetAnnotationText(PdfComment annotation, string text)
+    {
+        if (!annotation.CanEditText) throw new NotSupportedException("Текст этой аннотации нельзя изменить.");
+        if (text.Contains('\0') || text.Length > 20000) throw new ArgumentException("Введите текст длиной до 20 000 символов.");
+        EditAnnotation(annotation, (_, annot) => Pdfium.FPDFAnnot_SetStringValue(annot, "Contents", text));
+    }
+
+    /// <summary>Changes an annotation after checking that it is still the one the user selected.</summary>
+    private void EditAnnotation(PdfComment expected, Action<nint, nint> change) => Edit(() => OnPage(expected.PageIndex, page =>
+    {
+        var annot = Pdfium.FPDFPage_GetAnnot(page, expected.AnnotationIndex);
+        if (annot == 0) throw new InvalidOperationException("Аннотация больше не существует.");
+        try
+        {
+            if (ReadComment(page, annot, expected.PageIndex, expected.AnnotationIndex) != expected)
+                throw new InvalidOperationException("Аннотации изменились. Выберите аннотацию заново.");
+            change(page, annot);
+            Touch(annot);
+        }
+        finally
+        {
+            Pdfium.FPDFPage_CloseAnnot(annot);
+        }
+        GenerateAppearances(page);
+        return 0;
+    }), 32);
+
+    private static void SetColor(nint annot, int type, Color color)
+    {
+        var alpha = type == AnnotationType.Highlight ? HighlightAlpha : 255u;
+        if (Pdfium.FPDFAnnot_SetColor(annot, 0, color.R, color.G, color.B, alpha) == 0) throw new InvalidOperationException("Не удалось задать цвет аннотации.");
+    }
+
+    private static void SetRect(nint annot, Pdfium.RectF rect)
+    {
+        if (Pdfium.FPDFAnnot_SetRect(annot, ref rect) == 0) throw new InvalidOperationException("Не удалось задать положение аннотации.");
+    }
+
+    private static void Shift(nint annot, float dx, float dy)
+    {
+        if (Pdfium.FPDFAnnot_GetRect(annot, out var rect) == 0) throw new InvalidOperationException("Не удалось прочитать положение аннотации.");
+        SetRect(annot, new Pdfium.RectF { Left = rect.Left + dx, Right = rect.Right + dx, Top = rect.Top + dy, Bottom = rect.Bottom + dy });
+    }
+
+    private static void Touch(nint annot) => Pdfium.FPDFAnnot_SetStringValue(annot, "M", "D:" + DateTime.UtcNow.ToString("yyyyMMddHHmmss") + "Z");
+
+    private static Pdfium.RectF ToPdfRect(nint page, Rect bounds)
+    {
+        var corners = new[] { bounds.TopLeft, bounds.TopRight, bounds.BottomLeft, bounds.BottomRight }.Select(p => ToPdf(page, p)).ToArray();
+        return new Pdfium.RectF
+        {
+            Left = (float)corners.Min(p => p.X), Right = (float)corners.Max(p => p.X),
+            Bottom = (float)corners.Min(p => p.Y), Top = (float)corners.Max(p => p.Y)
+        };
+    }
+
+    private static Pdfium.RectF InkBounds(IEnumerable<Pdfium.PointF[]> strokes, float width)
+    {
+        var points = strokes.SelectMany(s => s).ToArray();
+        var margin = Math.Max(1, width);
+        return new Pdfium.RectF
+        {
+            Left = points.Min(p => p.X) - margin, Right = points.Max(p => p.X) + margin,
+            Bottom = points.Min(p => p.Y) - margin, Top = points.Max(p => p.Y) + margin
+        };
+    }
+
+    private static List<Pdfium.PointF[]> ReadInk(nint annot)
+    {
+        var strokes = new List<Pdfium.PointF[]>();
+        var count = Pdfium.FPDFAnnot_GetInkListCount(annot);
+        for (var i = 0u; i < count; i++)
+        {
+            var length = Pdfium.FPDFAnnot_GetInkListPath(annot, i, null, 0);
+            if (length == 0 || length > 100_000) continue;
+            var points = new Pdfium.PointF[length];
+            Pdfium.FPDFAnnot_GetInkListPath(annot, i, points, length);
+            strokes.Add(points);
+        }
+        return strokes;
+    }
+
+    /// <summary>PDFium creates missing appearance streams while rendering; do it now so saved files carry them.</summary>
+    private static void GenerateAppearances(nint page)
+    {
+        var bitmap = Pdfium.FPDFBitmap_Create(1, 1, 0);
+        if (bitmap == 0) return;
+        try
+        {
+            Pdfium.FPDF_RenderPageBitmap(bitmap, page, 0, 0, 1, 1, 0, 0x01);
+        }
+        finally
+        {
+            Pdfium.FPDFBitmap_Destroy(bitmap);
+        }
+    }
+
+    private static PdfComment? ReadComment(nint page, nint annot, int pageIndex, int annotationIndex)
+    {
+        var type = Pdfium.FPDFAnnot_GetSubtype(annot);
+        if (!PdfComment.MarkupTypes.Contains(type) || Pdfium.FPDFAnnot_GetRect(annot, out var box) == 0) return null;
+        var bounds = new Rect(ToDisplay(page, box.Left, box.Top), ToDisplay(page, box.Right, box.Bottom));
+        return new(pageIndex, annotationIndex, ReadString((buffer, n) => Pdfium.FPDFAnnot_GetStringValue(annot, "Contents", buffer, n)),
+            ReadString((buffer, n) => Pdfium.FPDFAnnot_GetStringValue(annot, "T", buffer, n)), type, bounds, ReadColor(annot, type));
+    }
+
+    private static Color ReadColor(nint annot, int type)
+    {
+        if (Pdfium.FPDFAnnot_GetColor(annot, 0, out var r, out var g, out var b, out _) != 0) return Color.FromRgb((byte)r, (byte)g, (byte)b);
+        // PDFium reports no colour once an appearance stream exists; the colour of its drawing is what the user sees.
+        var filled = type is AnnotationType.Highlight or AnnotationType.Note;
+        for (var i = 0; i < Pdfium.FPDFAnnot_GetObjectCount(annot); i++)
+        {
+            var obj = Pdfium.FPDFAnnot_GetObject(annot, i);
+            if (obj == 0 || Pdfium.FPDFPageObj_GetType(obj) != 2 || Pdfium.FPDFPath_GetDrawMode(obj, out var fillMode, out var stroke) == 0) continue;
+            if (filled && fillMode != 0 && Pdfium.FPDFPageObj_GetFillColor(obj, out r, out g, out b, out _) != 0 ||
+                !filled && stroke != 0 && Pdfium.FPDFPageObj_GetStrokeColor(obj, out r, out g, out b, out _) != 0)
+                return Color.FromRgb((byte)r, (byte)g, (byte)b);
+        }
+        return filled ? DefaultHighlight : Colors.Black;
     }
 
     /// <summary>Review annotations of the whole document, or of one page after a page-local change.</summary>
@@ -1000,10 +1224,7 @@ public sealed class PdfDocument : IDisposable
                         if (annot == 0) continue;
                         try
                         {
-                            var type = Pdfium.FPDFAnnot_GetSubtype(annot);
-                            if (!PdfComment.MarkupTypes.Contains(type)) continue;
-                            result.Add(new(index, a, ReadString((b, n) => Pdfium.FPDFAnnot_GetStringValue(annot, "Contents", b, n)),
-                                ReadString((b, n) => Pdfium.FPDFAnnot_GetStringValue(annot, "T", b, n)), type));
+                            if (ReadComment(page, annot, index, a) is { } comment) result.Add(comment);
                         }
                         finally
                         {
@@ -1024,10 +1245,8 @@ public sealed class PdfDocument : IDisposable
         var popupIndex = -1;
         try
         {
-            var current = new PdfComment(comment.PageIndex, comment.AnnotationIndex,
-                ReadString((b, n) => Pdfium.FPDFAnnot_GetStringValue(annot, "Contents", b, n)),
-                ReadString((b, n) => Pdfium.FPDFAnnot_GetStringValue(annot, "T", b, n)), Pdfium.FPDFAnnot_GetSubtype(annot));
-            if (current != comment) throw new InvalidOperationException("Аннотации изменились. Выберите аннотацию заново.");
+            if (ReadComment(page, annot, comment.PageIndex, comment.AnnotationIndex) != comment)
+                throw new InvalidOperationException("Аннотации изменились. Выберите аннотацию заново.");
             // The popup window of a markup annotation is a separate annotation; remove it as well.
             var popup = Pdfium.FPDFAnnot_GetLinkedAnnot(annot, "Popup");
             if (popup != 0)

@@ -11,6 +11,7 @@ internal static class Pdfium
     [StructLayout(LayoutKind.Sequential)] internal struct RectF { public float Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential)] internal struct Matrix { public float A, B, C, D, E, F; }
     [StructLayout(LayoutKind.Sequential)] internal struct Quad { public float X1, Y1, X2, Y2, X3, Y3, X4, Y4; }
+    [StructLayout(LayoutKind.Sequential)] internal struct PointF { public float X, Y; }
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] internal delegate int WriteBlock(nint self, nint data, uint size);
     [StructLayout(LayoutKind.Sequential)] internal struct FileWrite { public int Version; public nint Callback; }
 
@@ -113,6 +114,17 @@ internal static class Pdfium
     [DllImport(Dll)] internal static extern int FPDFAnnot_GetRect(nint annot, out RectF rect);
     [DllImport(Dll)] internal static extern int FPDFAnnot_SetColor(nint annot, int type, uint r, uint g, uint b, uint a);
     [DllImport(Dll)] internal static extern int FPDFAnnot_AppendAttachmentPoints(nint annot, ref Quad quad);
+    [DllImport(Dll)] internal static extern int FPDFAnnot_GetColor(nint annot, int type, out uint r, out uint g, out uint b, out uint a);
+    [DllImport(Dll)] internal static extern int FPDFAnnot_SetBorder(nint annot, float horizontal, float vertical, float width);
+    [DllImport(Dll)] internal static extern int FPDFAnnot_GetBorder(nint annot, out float horizontal, out float vertical, out float width);
+    [DllImport(Dll, CharSet = CharSet.Unicode)] internal static extern int FPDFAnnot_SetAP(nint annot, int mode, string? value);
+    [DllImport(Dll)] internal static extern int FPDFAnnot_AddInkStroke(nint annot, PointF[] points, nuint count);
+    [DllImport(Dll)] internal static extern int FPDFAnnot_RemoveInkList(nint annot);
+    [DllImport(Dll)] internal static extern int FPDFAnnot_GetObjectCount(nint annot);
+    [DllImport(Dll)] internal static extern nint FPDFAnnot_GetObject(nint annot, int index);
+    [DllImport(Dll)] internal static extern int FPDFPath_GetDrawMode(nint path, out int fillMode, out int stroke);
+    [DllImport(Dll)] internal static extern uint FPDFAnnot_GetInkListCount(nint annot);
+    [DllImport(Dll)] internal static extern uint FPDFAnnot_GetInkListPath(nint annot, uint index, [Out] PointF[]? buffer, uint length);
     [DllImport(Dll)] internal static extern int FPDFAnnot_SetFlags(nint annot, int flags);
     [DllImport(Dll, CharSet = CharSet.Unicode)] internal static extern int FPDFAnnot_SetStringValue(nint annot, [MarshalAs(UnmanagedType.LPUTF8Str)] string key, string value);
     [DllImport(Dll)] internal static extern uint FPDFAnnot_GetStringValue(nint annot, [MarshalAs(UnmanagedType.LPUTF8Str)] string key, byte[]? buffer, uint length);
