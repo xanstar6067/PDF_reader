@@ -18,7 +18,9 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Resource Include="Assets/paperdesk.ico" />
     <PackageReference Include="bblanchon.PDFium.Win32" Version="157.0.8086" />
+    <InternalsVisibleTo Include="PDF_Reader.Tests" />
     <Content Include="../../third-party/**/*" Link="third-party/%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 

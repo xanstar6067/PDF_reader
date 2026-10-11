@@ -81,6 +81,13 @@ internal static class Pdfium
     [DllImport(Dll)] internal static extern int FPDFPageObj_SetMatrix(nint obj, ref Matrix matrix);
     [DllImport(Dll)] internal static extern int FPDFPageObj_GetFillColor(nint obj, out uint r, out uint g, out uint b, out uint a);
     [DllImport(Dll)] internal static extern int FPDFPageObj_SetFillColor(nint obj, uint r, uint g, uint b, uint a);
+    [DllImport(Dll)] internal static extern int FPDFPageObj_GetStrokeColor(nint obj, out uint r, out uint g, out uint b, out uint a);
+    [DllImport(Dll)] internal static extern int FPDFPageObj_SetStrokeColor(nint obj, uint r, uint g, uint b, uint a);
+    [DllImport(Dll)] internal static extern int FPDFTextObj_GetTextRenderMode(nint obj);
+    [DllImport(Dll)] internal static extern int FPDFTextObj_SetTextRenderMode(nint obj, int mode);
+    [DllImport(Dll)] internal static extern nint FPDFTextObj_GetFont(nint obj);
+    [DllImport(Dll)] internal static extern int FPDFFont_GetIsEmbedded(nint font);
+    [DllImport(Dll)] internal static extern nint FPDFFont_GetGlyphPath(nint font, uint glyph, float size);
     [DllImport(Dll)] internal static extern int FPDFPage_InsertObject(nint page, nint obj);
     [DllImport(Dll)] internal static extern int FPDFPage_InsertObjectAtIndex(nint page, nint obj, nuint index);
     [DllImport(Dll)] internal static extern int FPDFPage_RemoveObject(nint page, nint obj);
@@ -100,6 +107,8 @@ internal static class Pdfium
     [DllImport(Dll)] internal static extern void FPDFPage_CloseAnnot(nint annot);
     [DllImport(Dll)] internal static extern int FPDFPage_RemoveAnnot(nint page, int index);
     [DllImport(Dll)] internal static extern int FPDFAnnot_GetSubtype(nint annot);
+    [DllImport(Dll)] internal static extern int FPDFPage_GetAnnotIndex(nint page, nint annot);
+    [DllImport(Dll)] internal static extern nint FPDFAnnot_GetLinkedAnnot(nint annot, [MarshalAs(UnmanagedType.LPUTF8Str)] string key);
     [DllImport(Dll)] internal static extern int FPDFAnnot_SetRect(nint annot, ref RectF rect);
     [DllImport(Dll)] internal static extern int FPDFAnnot_GetRect(nint annot, out RectF rect);
     [DllImport(Dll)] internal static extern int FPDFAnnot_SetColor(nint annot, int type, uint r, uint g, uint b, uint a);

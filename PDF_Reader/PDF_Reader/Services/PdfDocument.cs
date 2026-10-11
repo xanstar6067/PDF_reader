@@ -10,37 +10,63 @@ using PDF_Reader.Native;
 
 namespace PDF_Reader.Services;
 
-/// <summary>Owns a PDFium document and its input buffer. All native access is serialized.</summary>
+/// <summary>
+/// Owns a PDFium document and its input buffer. All native access is serialized by <see cref="Gate"/>.
+/// State read by the UI (page count, history, dirty flag) is published to plain fields, so reading it
+/// never waits for a long render or save running on another thread.
+/// </summary>
 public sealed class PdfDocument : IDisposable
 {
     internal static readonly object Gate = new();
+    private const uint SaveIncremental = 1;
+    private const uint SaveRewrite = 2;
+    private const long HistoryBudget = 128L * 1024 * 1024;
+    internal const int MaxRenderSide = 32_000;
+    internal const long MaxRenderPixels = 24_000_000;
+    private static readonly Lazy<TrueTypeSubsetter> UnicodeFont = new(() => new TrueTypeSubsetter(
+        File.ReadAllBytes(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Fonts), "segoeui.ttf"))));
     private static bool _initialized;
+
     private nint _handle;
     private GCHandle _input;
-    private nint _font;
+    private byte[] _buffer = [];
+    // True while the loaded buffer reproduces the current state, so it can be reused instead of serializing.
+    private bool _bufferIsCurrent;
     private FormFillSession? _forms;
     private readonly string? _password;
     private readonly LinkedList<Snapshot> _undo = new();
     private readonly Stack<Snapshot> _redo = new();
     private long _state, _savedState, _nextState;
     private byte[]? _diskHash;
-    private const long HistoryBudget = 128L * 1024 * 1024;
+
+    private volatile int _pageCount;
+    private volatile bool _canUndo, _canRedo, _isDirty;
+    private long _revision;
+
     private record Snapshot(byte[] Bytes, long State);
 
     public string? FilePath { get; private set; }
-    public long Revision { get; private set; }
-    public bool IsDirty { get { lock (Gate) return _state != _savedState; } }
-    public bool CanUndo { get { lock (Gate) return _undo.Count > 0; } }
-    public bool CanRedo { get { lock (Gate) return _redo.Count > 0; } }
-    public int PageCount { get { lock (Gate) { EnsureOpen(); return Pdfium.FPDF_GetPageCount(_handle); } } }
+    public long Revision => Interlocked.Read(ref _revision);
+    public bool IsDirty => _isDirty;
+    public bool CanUndo => _canUndo;
+    public bool CanRedo => _canRedo;
+    public int PageCount => _pageCount;
+
+    /// <summary>
+    /// Signed documents are saved as incremental updates: the signed revision stays byte-identical,
+    /// so existing signatures remain verifiable and later changes are reported by the validator.
+    /// </summary>
+    public bool SavesIncrementally { get; }
 
     private PdfDocument(byte[] bytes, string? password)
     {
         _password = password;
         lock (Gate)
         {
-            if (!_initialized) { Pdfium.FPDF_InitLibrary(); _initialized = true; }
+            EnsureLibrary();
             LoadBuffer(bytes);
+            SavesIncrementally = Pdfium.FPDF_GetSignatureCount(_handle) > 0;
+            Publish();
         }
     }
 
@@ -55,11 +81,23 @@ public sealed class PdfDocument : IDisposable
 
     public static PdfDocument FromBytes(byte[] bytes, string? password = null) => new(bytes, password);
 
+    /// <summary>Reopens an autosaved copy as a modified document bound to its original file.</summary>
+    public static PdfDocument Restore(byte[] bytes, string? password, string? originalPath, byte[]? diskHash)
+    {
+        var document = new PdfDocument(bytes, password) { FilePath = originalPath, _diskHash = diskHash };
+        lock (Gate)
+        {
+            document._state = ++document._nextState;
+            document.Publish();
+        }
+        return document;
+    }
+
     public static PdfDocument Create()
     {
         lock (Gate)
         {
-            if (!_initialized) { Pdfium.FPDF_InitLibrary(); _initialized = true; }
+            EnsureLibrary();
             var handle = Pdfium.FPDF_CreateNewDocument();
             if (handle == 0) throw new InvalidOperationException("Не удалось создать PDF.");
             try
@@ -67,15 +105,47 @@ public sealed class PdfDocument : IDisposable
                 var page = Pdfium.FPDFPage_New(handle, 0, 595.28, 841.89);
                 if (page == 0) throw new InvalidOperationException("Не удалось создать страницу.");
                 Pdfium.FPDF_ClosePage(page);
-                var document = new PdfDocument(Serialize(handle), null);
+                var document = new PdfDocument(Serialize(handle, SaveRewrite), null);
                 document._state = ++document._nextState;
+                document.Publish();
                 return document;
             }
-            finally { Pdfium.FPDF_CloseDocument(handle); }
+            finally
+            {
+                Pdfium.FPDF_CloseDocument(handle);
+            }
         }
     }
 
+    /// <summary>Independent copy of the current state, e.g. for printing while editing continues.</summary>
+    public PdfDocument CreateCopy()
+    {
+        lock (Gate)
+        {
+            EnsureOpen();
+            return new PdfDocument(CurrentBytes(), _password) { FilePath = FilePath };
+        }
+    }
+
+    private static void EnsureLibrary()
+    {
+        if (_initialized) return;
+        Pdfium.FPDF_InitLibrary();
+        _initialized = true;
+    }
+
     private void EnsureOpen() => ObjectDisposedException.ThrowIf(_handle == 0, this);
+
+    private int NativePageCount => Pdfium.FPDF_GetPageCount(_handle);
+
+    private void Publish()
+    {
+        _pageCount = _handle == 0 ? 0 : NativePageCount;
+        _canUndo = _undo.Count > 0;
+        _canRedo = _redo.Count > 0;
+        _isDirty = _state != _savedState;
+    }
+
     private void LoadBuffer(byte[] bytes)
     {
         // Open the new handle before releasing the old one; a failed reload preserves the old document.
@@ -89,37 +159,82 @@ public sealed class PdfDocument : IDisposable
             throw new InvalidDataException($"Не удалось прочитать PDF (код {error}). Файл повреждён или имеет неподдерживаемый формат.");
         }
         FormFillSession? forms;
-        try { forms = Pdfium.FPDF_GetFormType(handle) == 1 ? new FormFillSession(handle) : null; }
-        catch { Pdfium.FPDF_CloseDocument(handle); input.Free(); throw; }
+        try
+        {
+            forms = Pdfium.FPDF_GetFormType(handle) == 1 ? new FormFillSession(handle) : null;
+        }
+        catch
+        {
+            Pdfium.FPDF_CloseDocument(handle);
+            input.Free();
+            throw;
+        }
         CloseHandle();
-        _handle = handle; _input = input; _forms = forms;
+        _handle = handle;
+        _input = input;
+        _forms = forms;
+        _buffer = bytes;
+        _bufferIsCurrent = true;
     }
 
     private void CloseHandle()
     {
-        _forms?.Dispose(); _forms = null;
-        if (_font != 0) { Pdfium.FPDFFont_Close(_font); _font = 0; }
-        if (_handle != 0) { Pdfium.FPDF_CloseDocument(_handle); _handle = 0; }
+        _forms?.Dispose();
+        _forms = null;
+        if (_handle != 0)
+        {
+            Pdfium.FPDF_CloseDocument(_handle);
+            _handle = 0;
+        }
         if (_input.IsAllocated) _input.Free();
     }
 
-    public void Dispose() { lock (Gate) { CloseHandle(); _undo.Clear(); _redo.Clear(); } }
-    private T OnPage<T>(int index, Func<nint, T> action)
+    public void Dispose()
+    {
+        lock (Gate)
+        {
+            CloseHandle();
+            _undo.Clear();
+            _redo.Clear();
+            _buffer = [];
+            Publish();
+        }
+    }
+
+    /// <summary>Loads a page for the duration of <paramref name="action"/>. Form widgets are attached only when needed.</summary>
+    private T OnPage<T>(int index, Func<nint, T> action, bool forms = false)
     {
         EnsureOpen();
-        if (index < 0 || index >= Pdfium.FPDF_GetPageCount(_handle)) throw new ArgumentOutOfRangeException(nameof(index));
+        if (index < 0 || index >= NativePageCount) throw new ArgumentOutOfRangeException(nameof(index));
         var page = Pdfium.FPDF_LoadPage(_handle, index);
         if (page == 0) throw new InvalidDataException($"Не удалось загрузить страницу {index + 1}.");
-        try { _forms?.AfterLoad(index, page); return action(page); }
-        finally { _forms?.BeforeClose(index, page); Pdfium.FPDF_ClosePage(page); }
+        var session = forms ? _forms : null;
+        try
+        {
+            session?.AfterLoad(index, page);
+            return action(page);
+        }
+        finally
+        {
+            session?.BeforeClose(index, page);
+            Pdfium.FPDF_ClosePage(page);
+        }
     }
-    private T OnText<T>(nint page, Func<nint, T> action)
+
+    private static T OnText<T>(nint page, Func<nint, T> action)
     {
         var text = Pdfium.FPDFText_LoadPage(page);
         if (text == 0) throw new InvalidDataException("Не удалось извлечь текст страницы.");
-        try { return action(text); }
-        finally { Pdfium.FPDFText_ClosePage(text); }
+        try
+        {
+            return action(text);
+        }
+        finally
+        {
+            Pdfium.FPDFText_ClosePage(text);
+        }
     }
+
     private static string ReadString(Func<byte[]?, uint, uint> getter)
     {
         var size = getter(null, 0);
@@ -135,7 +250,7 @@ public sealed class PdfDocument : IDisposable
         {
             EnsureOpen();
             string Meta(string name) => ReadString((b, n) => Pdfium.FPDF_GetMetaText(_handle, name, b, n));
-            return new(Meta("Title"), Meta("Author"), Meta("Subject"), Meta("Creator"), PageCount,
+            return new(Meta("Title"), Meta("Author"), Meta("Subject"), Meta("Creator"), NativePageCount,
                 Pdfium.FPDF_GetSecurityHandlerRevision(_handle) >= 0, Pdfium.FPDF_GetSignatureCount(_handle),
                 Pdfium.FPDF_GetFormType(_handle), GetPermissions());
         }
@@ -146,8 +261,9 @@ public sealed class PdfDocument : IDisposable
         lock (Gate)
         {
             EnsureOpen();
-            var result = new List<PdfPageInfo>();
-            for (var i = 0; i < PageCount; i++)
+            var count = NativePageCount;
+            var result = new List<PdfPageInfo>(count);
+            for (var i = 0; i < count; i++)
             {
                 if (Pdfium.FPDF_GetPageSizeByIndexF(_handle, i, out var size) == 0 ||
                     !float.IsFinite(size.Width) || !float.IsFinite(size.Height) || size.Width <= 0 || size.Height <= 0)
@@ -159,6 +275,17 @@ public sealed class PdfDocument : IDisposable
         }
     }
 
+    /// <summary>Pixel size for a whole-page bitmap: keeps the aspect ratio and scales both sides down at the limits.</summary>
+    internal static (int Width, int Height) FitRenderSize(double pageWidth, double pageHeight, int requestedWidth)
+    {
+        if (!double.IsFinite(pageWidth) || !double.IsFinite(pageHeight) || pageWidth <= 0 || pageHeight <= 0)
+            throw new InvalidDataException("Некорректный размер страницы.");
+        double width = Math.Clamp(requestedWidth, 16, MaxRenderSide);
+        var height = width * pageHeight / pageWidth;
+        var scale = Math.Min(1, Math.Min(MaxRenderSide / Math.Max(width, height), Math.Sqrt(MaxRenderPixels / (width * height))));
+        return (Math.Max(1, (int)Math.Floor(width * scale)), Math.Max(1, (int)Math.Floor(height * scale)));
+    }
+
     public BitmapSource Render(int index, int width, bool printing = false, CancellationToken cancellation = default)
     {
         lock (Gate)
@@ -166,26 +293,51 @@ public sealed class PdfDocument : IDisposable
             cancellation.ThrowIfCancellationRequested();
             return OnPage(index, page =>
             {
-                var ratio = Pdfium.FPDF_GetPageHeightF(page) / Pdfium.FPDF_GetPageWidthF(page);
-                width = Math.Clamp(width, 16, 4096);
-                var height = Math.Max(1, (int)Math.Min(8192, Math.Ceiling(width * ratio)));
-                if ((long)width * height > 24_000_000) width = 24_000_000 / height;
-                var bitmap = Pdfium.FPDFBitmap_Create(width, height, 1);
-                if (bitmap == 0) throw new InvalidOperationException("Не удалось выделить память для страницы.");
-                try
-                {
-                    Pdfium.FPDFBitmap_FillRect(bitmap, 0, 0, width, height, 0xffffffff);
-                    Pdfium.FPDF_RenderPageBitmap(bitmap, page, 0, 0, width, height, 0, printing ? 0x801 : 0x3);
-                    if (_forms is not null) Pdfium.FPDF_FFLDraw(_forms.Handle, bitmap, page, 0, 0, width, height, 0, printing ? 0x801 : 0x3);
-                    var stride = Pdfium.FPDFBitmap_GetStride(bitmap);
-                    var image = BitmapSource.Create(width, height, 96, 96, PixelFormats.Bgra32, null,
-                        Pdfium.FPDFBitmap_GetBuffer(bitmap), checked(stride * height), stride);
-                    image.Freeze();
-                    cancellation.ThrowIfCancellationRequested();
-                    return image;
-                }
-                finally { Pdfium.FPDFBitmap_Destroy(bitmap); }
-            });
+                var (pixelWidth, pixelHeight) = FitRenderSize(Pdfium.FPDF_GetPageWidthF(page), Pdfium.FPDF_GetPageHeightF(page), width);
+                return RenderBitmap(page, pixelWidth, pixelHeight, new Int32Rect(0, 0, pixelWidth, pixelHeight), printing, cancellation);
+            }, forms: true);
+        }
+    }
+
+    /// <summary>Renders only <paramref name="region"/> of a page drawn at <paramref name="pageWidth"/>×<paramref name="pageHeight"/> pixels.</summary>
+    public BitmapSource RenderRegion(int index, int pageWidth, int pageHeight, Int32Rect region, CancellationToken cancellation = default)
+    {
+        if (pageWidth is < 1 or > MaxRenderSide || pageHeight is < 1 or > MaxRenderSide)
+            throw new ArgumentOutOfRangeException(nameof(pageWidth), "Слишком большой масштаб страницы.");
+        var left = Math.Clamp(region.X, 0, pageWidth);
+        var top = Math.Clamp(region.Y, 0, pageHeight);
+        var right = Math.Clamp(region.X + region.Width, left, pageWidth);
+        var bottom = Math.Clamp(region.Y + region.Height, top, pageHeight);
+        var clipped = new Int32Rect(left, top, right - left, bottom - top);
+        if (clipped.Width == 0 || clipped.Height == 0) throw new ArgumentException("Область страницы пуста.", nameof(region));
+        if ((long)clipped.Width * clipped.Height > MaxRenderPixels) throw new ArgumentOutOfRangeException(nameof(region), "Слишком большая область страницы.");
+        lock (Gate)
+        {
+            cancellation.ThrowIfCancellationRequested();
+            return OnPage(index, page => RenderBitmap(page, pageWidth, pageHeight, clipped, false, cancellation), forms: true);
+        }
+    }
+
+    private BitmapSource RenderBitmap(nint page, int pageWidth, int pageHeight, Int32Rect region, bool printing, CancellationToken cancellation)
+    {
+        var bitmap = Pdfium.FPDFBitmap_Create(region.Width, region.Height, 1);
+        if (bitmap == 0) throw new InvalidOperationException("Не удалось выделить память для страницы.");
+        try
+        {
+            var flags = printing ? 0x801 : 0x3;
+            Pdfium.FPDFBitmap_FillRect(bitmap, 0, 0, region.Width, region.Height, 0xffffffff);
+            Pdfium.FPDF_RenderPageBitmap(bitmap, page, -region.X, -region.Y, pageWidth, pageHeight, 0, flags);
+            if (_forms is not null) Pdfium.FPDF_FFLDraw(_forms.Handle, bitmap, page, -region.X, -region.Y, pageWidth, pageHeight, 0, flags);
+            var stride = Pdfium.FPDFBitmap_GetStride(bitmap);
+            var image = BitmapSource.Create(region.Width, region.Height, 96, 96, PixelFormats.Bgra32, null,
+                Pdfium.FPDFBitmap_GetBuffer(bitmap), checked(stride * region.Height), stride);
+            image.Freeze();
+            cancellation.ThrowIfCancellationRequested();
+            return image;
+        }
+        finally
+        {
+            Pdfium.FPDFBitmap_Destroy(bitmap);
         }
     }
 
@@ -196,12 +348,14 @@ public sealed class PdfDocument : IDisposable
             throw new InvalidOperationException("Не удалось преобразовать координаты страницы.");
         return new(x, y);
     }
+
     private static Point ToDisplay(nint page, double x, double y)
     {
         if (Pdfium.FPDF_PageToDevice(page, 0, 0, 10000, 10000, 0, x, y, out var dx, out var dy) == 0)
             throw new InvalidOperationException("Не удалось преобразовать координаты страницы.");
         return new(dx / 10000.0, dy / 10000.0);
     }
+
     private static IReadOnlyList<Rect> GetRects(nint page, nint text, int start, int count)
     {
         var result = new List<Rect>();
@@ -211,6 +365,7 @@ public sealed class PdfDocument : IDisposable
                 result.Add(new(ToDisplay(page, l, t), ToDisplay(page, r, b)));
         return result;
     }
+
     private static string GetText(nint text, int start, int count)
     {
         if (count <= 0) return "";
@@ -218,6 +373,7 @@ public sealed class PdfDocument : IDisposable
         var length = Pdfium.FPDFText_GetText(text, start, count, buffer);
         return length > 0 ? Encoding.Unicode.GetString(buffer, 0, Math.Min(buffer.Length, length * 2)).TrimEnd('\0') : "";
     }
+
     public string ExtractText(int index)
     {
         lock (Gate)
@@ -226,6 +382,7 @@ public sealed class PdfDocument : IDisposable
             return OnPage(index, p => OnText(p, t => GetText(t, 0, Pdfium.FPDFText_CountChars(t))));
         }
     }
+
     public TextSelection SelectText(int index, Point from, Point to)
     {
         lock (Gate)
@@ -233,11 +390,13 @@ public sealed class PdfDocument : IDisposable
             RequirePermission(16, "Копирование текста запрещено владельцем PDF.");
             return OnPage(index, p => OnText(p, t =>
             {
-                var a = ToPdf(p, from); var b = ToPdf(p, to);
+                var a = ToPdf(p, from);
+                var b = ToPdf(p, to);
                 var first = Pdfium.FPDFText_GetCharIndexAtPos(t, a.X, a.Y, 12, 12);
                 var last = Pdfium.FPDFText_GetCharIndexAtPos(t, b.X, b.Y, 12, 12);
                 if (first < 0 || last < 0) return new TextSelection("", []);
-                var start = Math.Min(first, last); var count = Math.Abs(last - first) + 1;
+                var start = Math.Min(first, last);
+                var count = Math.Abs(last - first) + 1;
                 return new TextSelection(GetText(t, start, count), GetRects(p, t, start, count));
             }));
         }
@@ -265,13 +424,18 @@ public sealed class PdfDocument : IDisposable
                         while (Pdfium.FPDFText_FindNext(handle) != 0 && result.Count < 10000)
                         {
                             cancellation.ThrowIfCancellationRequested();
-                            var start = Pdfium.FPDFText_GetSchResultIndex(handle); var count = Pdfium.FPDFText_GetSchCount(handle);
+                            var start = Pdfium.FPDFText_GetSchResultIndex(handle);
+                            var count = Pdfium.FPDFText_GetSchCount(handle);
                             var previewStart = Math.Max(0, start - 35);
                             var previewLength = Math.Min(Pdfium.FPDFText_CountChars(t) - previewStart, count + 85);
-                            result.Add(new(pageIndex, start, count, GetText(t, previewStart, previewLength).Replace("\r", " ").Replace("\n", " "), GetRects(p, t, start, count)));
+                            var preview = GetText(t, previewStart, previewLength).Replace("\r", " ").Replace("\n", " ");
+                            result.Add(new(pageIndex, start, count, preview, GetRects(p, t, start, count)));
                         }
                     }
-                    finally { Pdfium.FPDFText_FindClose(handle); }
+                    finally
+                    {
+                        Pdfium.FPDFText_FindClose(handle);
+                    }
                     return 0;
                 }));
             }
@@ -295,8 +459,8 @@ public sealed class PdfDocument : IDisposable
                     if (visited.Count >= 10000 || !visited.Add(node)) break;
                     var dest = Pdfium.FPDFBookmark_GetDest(_handle, node);
                     if (dest == 0) dest = Pdfium.FPDFAction_GetDest(_handle, Pdfium.FPDFBookmark_GetAction(node));
-                    nodes.Add(new(ReadString((b, n) => Pdfium.FPDFBookmark_GetTitle(node, b, n)),
-                        dest == 0 ? -1 : Pdfium.FPDFDest_GetDestPageIndex(_handle, dest), Read(node, depth + 1)));
+                    var title = ReadString((b, n) => Pdfium.FPDFBookmark_GetTitle(node, b, n));
+                    nodes.Add(new(title, dest == 0 ? -1 : Pdfium.FPDFDest_GetDestPageIndex(_handle, dest), Read(node, depth + 1)));
                 }
                 return nodes;
             }
@@ -333,7 +497,8 @@ public sealed class PdfDocument : IDisposable
         {
             return OnPage(index, p =>
             {
-                var pdf = ToPdf(p, point); var link = Pdfium.FPDFLink_GetLinkAtPoint(p, pdf.X, pdf.Y);
+                var pdf = ToPdf(p, point);
+                var link = Pdfium.FPDFLink_GetLinkAtPoint(p, pdf.X, pdf.Y);
                 if (link == 0) return null;
                 var dest = Pdfium.FPDFLink_GetDest(_handle, link);
                 var action = Pdfium.FPDFLink_GetAction(link);
@@ -341,7 +506,8 @@ public sealed class PdfDocument : IDisposable
                 if (dest != 0) return new PdfLink(Pdfium.FPDFDest_GetDestPageIndex(_handle, dest), null);
                 var size = Pdfium.FPDFAction_GetURIPath(_handle, action, null, 0);
                 if (size == 0 || size > 65536) return null;
-                var buffer = new byte[size]; Pdfium.FPDFAction_GetURIPath(_handle, action, buffer, size);
+                var buffer = new byte[size];
+                Pdfium.FPDFAction_GetURIPath(_handle, action, buffer, size);
                 return new PdfLink(-1, Encoding.UTF8.GetString(buffer).TrimEnd('\0'));
             });
         }
@@ -356,23 +522,31 @@ public sealed class PdfDocument : IDisposable
             {
                 for (var i = 0; i < Pdfium.FPDFPage_GetAnnotCount(page); i++)
                 {
-                    var annot = Pdfium.FPDFPage_GetAnnot(page, i); if (annot == 0) continue;
+                    var annot = Pdfium.FPDFPage_GetAnnot(page, i);
+                    if (annot == 0) continue;
                     try
                     {
                         if (Pdfium.FPDFAnnot_GetSubtype(annot) != 20 || Pdfium.FPDFAnnot_GetRect(annot, out var box) == 0) continue;
                         var bounds = new Rect(ToDisplay(page, box.Left, box.Top), ToDisplay(page, box.Right, box.Bottom));
                         if (!bounds.Contains(point)) continue;
-                        var type = Pdfium.FPDFAnnot_GetFormFieldType(_forms.Handle, annot);
-                        return new PdfFormField(index, i, ReadString((b, n) => Pdfium.FPDFAnnot_GetFormFieldName(_forms.Handle, annot, b, n)),
-                            ReadString((b, n) => Pdfium.FPDFAnnot_GetFormFieldValue(_forms.Handle, annot, b, n)), type,
-                            (Pdfium.FPDFAnnot_GetFormFieldFlags(_forms.Handle, annot) & 1) != 0, Pdfium.FPDFAnnot_IsChecked(_forms.Handle, annot) != 0, bounds, Revision);
+                        var form = _forms.Handle;
+                        return new PdfFormField(index, i,
+                            ReadString((b, n) => Pdfium.FPDFAnnot_GetFormFieldName(form, annot, b, n)),
+                            ReadString((b, n) => Pdfium.FPDFAnnot_GetFormFieldValue(form, annot, b, n)),
+                            Pdfium.FPDFAnnot_GetFormFieldType(form, annot),
+                            (Pdfium.FPDFAnnot_GetFormFieldFlags(form, annot) & 1) != 0,
+                            Pdfium.FPDFAnnot_IsChecked(form, annot) != 0, bounds, Revision);
                     }
-                    finally { Pdfium.FPDFPage_CloseAnnot(annot); }
+                    finally
+                    {
+                        Pdfium.FPDFPage_CloseAnnot(annot);
+                    }
                 }
                 return null;
-            });
+            }, forms: true);
         }
     }
+
     public void FillFormField(PdfFormField field, string value)
     {
         if (field.ReadOnly) throw new UnauthorizedAccessException("Поле формы доступно только для чтения.");
@@ -395,13 +569,15 @@ public sealed class PdfDocument : IDisposable
             }
             Pdfium.FORM_ForceToKillFocus(_forms.Handle);
             return 0;
-        }), 256);
+        }, forms: true), 256);
     }
+
     private void RequirePermission(uint bit, string message)
     {
         EnsureOpen();
         if ((GetPermissions() & bit) == 0) throw new UnauthorizedAccessException(message);
     }
+
     private uint GetPermissions()
     {
         var permissions = Pdfium.FPDF_GetDocPermissions(_handle);
@@ -415,96 +591,255 @@ public sealed class PdfDocument : IDisposable
         }
         return permissions;
     }
+
+    private byte[] CurrentBytes() => _bufferIsCurrent ? _buffer : Serialize(_handle, SavesIncrementally ? SaveIncremental : SaveRewrite);
+
     private void Edit(Action action, uint permission = 8)
     {
         lock (Gate)
         {
             RequirePermission(permission, "Эта операция запрещена настройками защиты PDF.");
-            var before = new Snapshot(Serialize(_handle), _state);
-            try { action(); }
-            catch { LoadBuffer(before.Bytes); Revision++; throw; }
-            _undo.AddLast(before); _redo.Clear(); _state = ++_nextState; Revision++;
+            var before = new Snapshot(CurrentBytes(), _state);
+            try
+            {
+                action();
+            }
+            catch (Exception failure)
+            {
+                try
+                {
+                    LoadBuffer(before.Bytes);
+                }
+                catch (Exception restore)
+                {
+                    throw new AggregateException("Не удалось восстановить документ после ошибки изменения.", failure, restore);
+                }
+                finally
+                {
+                    Interlocked.Increment(ref _revision);
+                    Publish();
+                }
+                throw;
+            }
+            _bufferIsCurrent = false;
+            _undo.AddLast(before);
+            _redo.Clear();
+            _state = ++_nextState;
+            Interlocked.Increment(ref _revision);
             TrimHistory();
+            Publish();
         }
     }
+
     private void TrimHistory()
     {
-        long size = _undo.Sum(s => (long)s.Bytes.Length) + _redo.Sum(s => (long)s.Bytes.Length);
+        // Snapshots may share the loaded buffer; count each array once.
+        long size = _undo.Select(s => s.Bytes).Concat(_redo.Select(s => s.Bytes)).Distinct().Sum(b => (long)b.Length);
         while (_undo.Count > 1 && (_undo.Count > 20 || size > HistoryBudget))
         {
-            size -= _undo.First!.Value.Bytes.Length; _undo.RemoveFirst();
+            var removed = _undo.First!.Value.Bytes;
+            _undo.RemoveFirst();
+            if (!_undo.Any(s => ReferenceEquals(s.Bytes, removed)) && !_redo.Any(s => ReferenceEquals(s.Bytes, removed))) size -= removed.Length;
         }
     }
+
     public void Undo()
     {
         lock (Gate)
         {
-            EnsureOpen(); if (_undo.Last is null) return;
-            var target = _undo.Last.Value; var current = new Snapshot(Serialize(_handle), _state);
-            LoadBuffer(target.Bytes); _undo.RemoveLast(); _redo.Push(current); _state = target.State; Revision++;
+            EnsureOpen();
+            if (_undo.Last is null) return;
+            var target = _undo.Last.Value;
+            var current = new Snapshot(CurrentBytes(), _state);
+            LoadBuffer(target.Bytes);
+            _undo.RemoveLast();
+            _redo.Push(current);
+            _state = target.State;
+            Interlocked.Increment(ref _revision);
+            Publish();
         }
     }
+
     public void Redo()
     {
         lock (Gate)
         {
-            EnsureOpen(); if (_redo.Count == 0) return;
-            var target = _redo.Peek(); var current = new Snapshot(Serialize(_handle), _state);
-            LoadBuffer(target.Bytes); _redo.Pop(); _undo.AddLast(current); _state = target.State; Revision++; TrimHistory();
+            EnsureOpen();
+            if (_redo.Count == 0) return;
+            var target = _redo.Peek();
+            var current = new Snapshot(CurrentBytes(), _state);
+            LoadBuffer(target.Bytes);
+            _redo.Pop();
+            _undo.AddLast(current);
+            _state = target.State;
+            Interlocked.Increment(ref _revision);
+            TrimHistory();
+            Publish();
         }
     }
-    private nint GetUnicodeFont()
+
+    /// <summary>Embeds a Segoe UI subset that contains exactly the characters of <paramref name="text"/>.</summary>
+    private nint LoadUnicodeFont(string text)
     {
-        if (_font != 0) return _font;
-        var fontPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Fonts), "segoeui.ttf");
-        var bytes = File.ReadAllBytes(fontPath);
-        _font = Pdfium.FPDFText_LoadFont(_handle, bytes, (uint)bytes.Length, 2, 1);
-        if (_font == 0) throw new InvalidOperationException("Не удалось загрузить шрифт Segoe UI.");
-        return _font;
+        var codepoints = text.EnumerateRunes().Select(r => r.Value).Where(c => c is not ('\r' or '\n'));
+        var subset = UnicodeFont.Value.Subset(codepoints);
+        var font = Pdfium.FPDFText_LoadFont(_handle, subset, (uint)subset.Length, 2, 1);
+        if (font == 0) throw new InvalidOperationException("Не удалось встроить шрифт Segoe UI.");
+        return font;
     }
-    private nint CreateText(string text, float size)
+
+    private nint NewText(nint font, string text, float size)
     {
-        var obj = Pdfium.FPDFPageObj_CreateTextObj(_handle, GetUnicodeFont(), size);
+        var obj = Pdfium.FPDFPageObj_CreateTextObj(_handle, font, size);
         if (obj == 0) throw new InvalidOperationException("Не удалось создать текстовый объект.");
         if (Pdfium.FPDFText_SetText(obj, text) != 0) return obj;
         Pdfium.FPDFPageObj_Destroy(obj);
         throw new InvalidOperationException("Не удалось записать текст в PDF.");
     }
+
     private static void Generate(nint page)
     {
         if (Pdfium.FPDFPage_GenerateContent(page) == 0) throw new InvalidOperationException("Не удалось обновить содержимое страницы.");
     }
+
+    private readonly record struct TextStyle(Pdfium.Matrix Matrix, uint[] Fill, uint[]? Stroke, int RenderMode)
+    {
+        public static TextStyle Read(nint obj)
+        {
+            if (Pdfium.FPDFPageObj_GetMatrix(obj, out var matrix) == 0) throw new InvalidOperationException("Не удалось прочитать положение текста.");
+            // A missing colour must not turn into transparent black.
+            uint[] fill = Pdfium.FPDFPageObj_GetFillColor(obj, out var r, out var g, out var b, out var a) != 0 ? [r, g, b, a] : [0, 0, 0, 255];
+            uint[]? stroke = Pdfium.FPDFPageObj_GetStrokeColor(obj, out var sr, out var sg, out var sb, out var sa) != 0 ? [sr, sg, sb, sa] : null;
+            return new(matrix, fill, stroke, Pdfium.FPDFTextObj_GetTextRenderMode(obj));
+        }
+
+        public void Apply(nint obj)
+        {
+            var matrix = Matrix;
+            if (Pdfium.FPDFPageObj_SetMatrix(obj, ref matrix) == 0 || Pdfium.FPDFPageObj_SetFillColor(obj, Fill[0], Fill[1], Fill[2], Fill[3]) == 0)
+                throw new InvalidOperationException("Не удалось сохранить стиль текста.");
+            if (Stroke is { } s) Pdfium.FPDFPageObj_SetStrokeColor(obj, s[0], s[1], s[2], s[3]);
+            if (RenderMode is >= 0 and <= 7) Pdfium.FPDFTextObj_SetTextRenderMode(obj, RenderMode);
+        }
+    }
+
+    /// <summary>Characters already drawn on the page with <paramref name="font"/>; an embedded subset certainly has their glyphs.</summary>
+    private static HashSet<int> CharactersInFont(nint page, nint font) => OnText(page, t =>
+    {
+        var result = new HashSet<int>();
+        for (var i = 0; i < Pdfium.FPDFPage_CountObjects(page); i++)
+        {
+            var obj = Pdfium.FPDFPage_GetObject(page, i);
+            if (Pdfium.FPDFPageObj_GetType(obj) != 1 || Pdfium.FPDFTextObj_GetFont(obj) != font) continue;
+            foreach (var rune in ReadString((b, n) => Pdfium.FPDFTextObj_GetText(obj, t, b, n)).EnumerateRunes()) result.Add(rune.Value);
+        }
+        return result;
+    });
+
+    private static bool CanDrawWith(nint font, HashSet<int> known, string text, float size)
+    {
+        var embedded = Pdfium.FPDFFont_GetIsEmbedded(font) != 0;
+        foreach (var rune in text.EnumerateRunes())
+        {
+            if (Rune.IsWhiteSpace(rune)) continue;
+            if (embedded && !known.Contains(rune.Value)) return false;
+            if (rune.Value > 0xFFFF || Pdfium.FPDFFont_GetGlyphPath(font, (uint)rune.Value, size) == 0) return false;
+        }
+        return true;
+    }
+
+    private static string CollapseWhitespace(string text) =>
+        string.Join(' ', text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+
     public void ReplaceText(EditableText selected, string text, float size)
     {
+        text = text.Replace("\r\n", " ").Replace('\r', ' ').Replace('\n', ' ').Replace('\t', ' ');
         ValidateText(text, size, allowEmpty: true);
         Edit(() => OnPage(selected.PageIndex, page =>
         {
             if (selected.Revision != Revision) throw new InvalidOperationException("Документ изменился. Выберите текст заново.");
-            var obj = Pdfium.FPDFPage_GetObject(page, selected.ObjectIndex);
+            var index = selected.ObjectIndex;
+            var obj = Pdfium.FPDFPage_GetObject(page, index);
             if (obj == 0 || Pdfium.FPDFPageObj_GetType(obj) != 1) throw new InvalidOperationException("Текстовый объект больше не существует.");
-            Pdfium.FPDFPageObj_GetMatrix(obj, out var matrix);
-            Pdfium.FPDFPageObj_GetFillColor(obj, out var r, out var g, out var b, out var a);
+            var style = TextStyle.Read(obj);
+            nint replacement = 0;
+            if (text.Length > 0)
+            {
+                // Prefer the original font: it keeps the look of the document. The new object is created
+                // before the old one is destroyed, because the font may be owned by that object alone.
+                var font = Pdfium.FPDFTextObj_GetFont(obj);
+                if (font != 0 && CanDrawWith(font, CharactersInFont(page, font), text, size))
+                {
+                    replacement = NewText(font, text, size);
+                    try
+                    {
+                        style.Apply(replacement);
+                    }
+                    catch
+                    {
+                        Pdfium.FPDFPageObj_Destroy(replacement);
+                        throw;
+                    }
+                    if (Pdfium.FPDFPage_InsertObjectAtIndex(page, replacement, (nuint)index) == 0)
+                    {
+                        Pdfium.FPDFPageObj_Destroy(replacement);
+                        throw new InvalidOperationException("Не удалось вставить замену текста.");
+                    }
+                    index++;
+                }
+            }
             if (Pdfium.FPDFPage_RemoveObject(page, obj) == 0) throw new InvalidOperationException("Не удалось удалить исходный текст.");
             Pdfium.FPDFPageObj_Destroy(obj);
-            if (!string.IsNullOrEmpty(text))
+
+            // The encoding round trip catches characters the original font cannot represent.
+            if (replacement != 0)
             {
-                var replacement = CreateText(text, size);
-                if (Pdfium.FPDFPageObj_SetMatrix(replacement, ref matrix) == 0 || Pdfium.FPDFPageObj_SetFillColor(replacement, r, g, b, a) == 0)
-                { Pdfium.FPDFPageObj_Destroy(replacement); throw new InvalidOperationException("Не удалось сохранить стиль текста."); }
-                if (Pdfium.FPDFPage_InsertObjectAtIndex(page, replacement, (nuint)selected.ObjectIndex) == 0)
-                { Pdfium.FPDFPageObj_Destroy(replacement); throw new InvalidOperationException("Не удалось вставить замену текста."); }
+                var stored = OnText(page, t => ReadString((b, n) => Pdfium.FPDFTextObj_GetText(replacement, t, b, n)));
+                if (CollapseWhitespace(stored) != CollapseWhitespace(text))
+                {
+                    if (Pdfium.FPDFPage_RemoveObject(page, replacement) == 0) throw new InvalidOperationException("Не удалось удалить исходный текст.");
+                    Pdfium.FPDFPageObj_Destroy(replacement);
+                    replacement = 0;
+                }
             }
-            Generate(page); return 0;
+            if (text.Length > 0 && replacement == 0)
+            {
+                var font = LoadUnicodeFont(text);
+                try
+                {
+                    replacement = NewText(font, text, size);
+                    try
+                    {
+                        style.Apply(replacement);
+                        if (Pdfium.FPDFPage_InsertObjectAtIndex(page, replacement, (nuint)selected.ObjectIndex) == 0)
+                            throw new InvalidOperationException("Не удалось вставить замену текста.");
+                    }
+                    catch
+                    {
+                        Pdfium.FPDFPageObj_Destroy(replacement);
+                        throw;
+                    }
+                }
+                finally
+                {
+                    Pdfium.FPDFFont_Close(font);
+                }
+            }
+            Generate(page);
+            return 0;
         }));
     }
+
     private static void ValidateText(string text, float size, bool allowEmpty = false)
     {
         if ((!allowEmpty && string.IsNullOrWhiteSpace(text)) || text.Contains('\0') || text.Length > 20000)
             throw new ArgumentException("Введите текст длиной до 20 000 символов.");
         if (!float.IsFinite(size) || size < 4 || size > 200) throw new ArgumentException("Размер шрифта должен быть от 4 до 200 пт.");
     }
+
     public void AddText(int index, Point point, string text, float size)
     {
+        text = text.Replace("\r", "").Replace('\t', ' ');
         ValidateText(text, size);
         Edit(() => OnPage(index, page =>
         {
@@ -512,52 +847,77 @@ public sealed class PdfDocument : IDisposable
             // Follow display orientation even when the PDF page is rotated.
             var right = ToPdf(page, new Point(point.X + .001, point.Y));
             var angle = Math.Atan2(right.Y - origin.Y, right.X - origin.X);
-            var line = 0;
-            foreach (var content in text.Replace("\r", "").Split('\n'))
+            var font = LoadUnicodeFont(text);
+            try
             {
-                if (!string.IsNullOrEmpty(content))
+                var line = 0;
+                foreach (var content in text.Split('\n'))
                 {
-                    var obj = CreateText(content, size);
-                    var matrix = new Pdfium.Matrix { A = (float)Math.Cos(angle), B = (float)Math.Sin(angle),
-                        C = (float)-Math.Sin(angle), D = (float)Math.Cos(angle),
-                        E = (float)(origin.X + Math.Sin(angle) * line * size * 1.35), F = (float)(origin.Y - Math.Cos(angle) * line * size * 1.35) };
-                    if (Pdfium.FPDFPageObj_SetMatrix(obj, ref matrix) == 0)
-                    { Pdfium.FPDFPageObj_Destroy(obj); throw new InvalidOperationException("Не удалось разместить текст."); }
-                    if (Pdfium.FPDFPage_InsertObject(page, obj) == 0) throw new InvalidOperationException("Не удалось добавить текст.");
+                    if (content.Length > 0)
+                    {
+                        var obj = NewText(font, content, size);
+                        var offset = line * size * 1.35;
+                        var matrix = new Pdfium.Matrix
+                        {
+                            A = (float)Math.Cos(angle), B = (float)Math.Sin(angle),
+                            C = (float)-Math.Sin(angle), D = (float)Math.Cos(angle),
+                            E = (float)(origin.X + Math.Sin(angle) * offset), F = (float)(origin.Y - Math.Cos(angle) * offset)
+                        };
+                        if (Pdfium.FPDFPageObj_SetMatrix(obj, ref matrix) == 0 || Pdfium.FPDFPage_InsertObject(page, obj) == 0)
+                        {
+                            Pdfium.FPDFPageObj_Destroy(obj);
+                            throw new InvalidOperationException("Не удалось добавить текст.");
+                        }
+                    }
+                    line++;
                 }
-                line++;
             }
-            Generate(page); return 0;
+            finally
+            {
+                Pdfium.FPDFFont_Close(font);
+            }
+            Generate(page);
+            return 0;
         }));
     }
+
     public void RotatePage(int index, int direction) => Edit(() => OnPage(index, p =>
-    { Pdfium.FPDFPage_SetRotation(p, (Pdfium.FPDFPage_GetRotation(p) + direction + 4) % 4); return 0; }), 1024);
+    {
+        Pdfium.FPDFPage_SetRotation(p, (Pdfium.FPDFPage_GetRotation(p) + direction + 4) % 4);
+        return 0;
+    }), 1024);
+
     public void DeletePage(int index) => Edit(() =>
     {
-        if (PageCount <= 1) throw new InvalidOperationException("В документе должна остаться хотя бы одна страница.");
-        if (index < 0 || index >= PageCount) throw new ArgumentOutOfRangeException(nameof(index));
+        if (NativePageCount <= 1) throw new InvalidOperationException("В документе должна остаться хотя бы одна страница.");
+        if (index < 0 || index >= NativePageCount) throw new ArgumentOutOfRangeException(nameof(index));
         Pdfium.FPDFPage_Delete(_handle, index);
     }, 1024);
+
     public void MovePage(int from, int to) => Edit(() =>
     {
-        if (from < 0 || from >= PageCount || to < 0 || to >= PageCount) throw new ArgumentOutOfRangeException(nameof(to));
+        var count = NativePageCount;
+        if (from < 0 || from >= count || to < 0 || to >= count) throw new ArgumentOutOfRangeException(nameof(to));
         if (Pdfium.FPDF_MovePages(_handle, [from], 1, to) == 0) throw new InvalidOperationException("Не удалось переместить страницу.");
     }, 1024);
+
     public void InsertBlankPage(int index) => Edit(() =>
     {
-        if (index < 0 || index > PageCount) throw new ArgumentOutOfRangeException(nameof(index));
+        if (index < 0 || index > NativePageCount) throw new ArgumentOutOfRangeException(nameof(index));
         var page = Pdfium.FPDFPage_New(_handle, index, 595.28, 841.89);
         if (page == 0) throw new InvalidOperationException("Не удалось вставить страницу.");
         Pdfium.FPDF_ClosePage(page);
     }, 1024);
+
     public void ImportPages(PdfDocument source, int index) => Edit(() =>
     {
         source.EnsureOpen();
         if (ReferenceEquals(source, this)) throw new ArgumentException("Выберите другой документ.");
-        if (index < 0 || index > PageCount) throw new ArgumentOutOfRangeException(nameof(index));
+        if (index < 0 || index > NativePageCount) throw new ArgumentOutOfRangeException(nameof(index));
         source.RequirePermission(16, "Копирование страниц исходного PDF запрещено.");
         if (Pdfium.FPDF_ImportPages(_handle, source._handle, null, index) == 0) throw new InvalidOperationException("Не удалось импортировать страницы.");
     }, 1024);
+
     public byte[] ExportPages(string range)
     {
         lock (Gate)
@@ -568,14 +928,19 @@ public sealed class PdfDocument : IDisposable
             try
             {
                 if (Pdfium.FPDF_ImportPages(export, _handle, range, 0) == 0) throw new ArgumentException("Укажите страницы, например: 1-3,5.");
-                return Serialize(export);
+                return Serialize(export, SaveRewrite);
             }
-            finally { Pdfium.FPDF_CloseDocument(export); }
+            finally
+            {
+                Pdfium.FPDF_CloseDocument(export);
+            }
         }
     }
 
     public void AddNote(int index, Point point, string content) => AddAnnotation(index, [new Rect(point, new Size(.025, .025))], content, 1);
+
     public void Highlight(int index, IReadOnlyList<Rect> rectangles) => AddAnnotation(index, rectangles, "", 9);
+
     private void AddAnnotation(int index, IReadOnlyList<Rect> rectangles, string content, int type)
     {
         if (rectangles.Count == 0) return;
@@ -588,15 +953,18 @@ public sealed class PdfDocument : IDisposable
                 var bounds = Rect.Empty;
                 foreach (var rect in rectangles)
                 {
-                    var tl = ToPdf(page, rect.TopLeft); var tr = ToPdf(page, rect.TopRight);
-                    var bl = ToPdf(page, rect.BottomLeft); var br = ToPdf(page, rect.BottomRight);
+                    var tl = ToPdf(page, rect.TopLeft);
+                    var tr = ToPdf(page, rect.TopRight);
+                    var bl = ToPdf(page, rect.BottomLeft);
+                    var br = ToPdf(page, rect.BottomRight);
                     foreach (var pt in new[] { tl, tr, bl, br }) bounds.Union(pt);
-                    if (type == 9)
+                    if (type != 9) continue;
+                    var quad = new Pdfium.Quad
                     {
-                        var quad = new Pdfium.Quad { X1 = (float)tl.X, Y1 = (float)tl.Y, X2 = (float)tr.X, Y2 = (float)tr.Y,
-                            X3 = (float)bl.X, Y3 = (float)bl.Y, X4 = (float)br.X, Y4 = (float)br.Y };
-                        if (Pdfium.FPDFAnnot_AppendAttachmentPoints(annot, ref quad) == 0) throw new InvalidOperationException("Не удалось выделить текст.");
-                    }
+                        X1 = (float)tl.X, Y1 = (float)tl.Y, X2 = (float)tr.X, Y2 = (float)tr.Y,
+                        X3 = (float)bl.X, Y3 = (float)bl.Y, X4 = (float)br.X, Y4 = (float)br.Y
+                    };
+                    if (Pdfium.FPDFAnnot_AppendAttachmentPoints(annot, ref quad) == 0) throw new InvalidOperationException("Не удалось выделить текст.");
                 }
                 var native = new Pdfium.RectF { Left = (float)bounds.Left, Right = (float)bounds.Right, Top = (float)bounds.Bottom, Bottom = (float)bounds.Top };
                 if (Pdfium.FPDFAnnot_SetRect(annot, ref native) == 0 || Pdfium.FPDFAnnot_SetColor(annot, 0, 255, 202, 40, type == 9 ? 110u : 255u) == 0)
@@ -606,19 +974,25 @@ public sealed class PdfDocument : IDisposable
                 Pdfium.FPDFAnnot_SetStringValue(annot, "T", Environment.UserName);
                 Pdfium.FPDFAnnot_SetStringValue(annot, "M", "D:" + DateTime.UtcNow.ToString("yyyyMMddHHmmss") + "Z");
             }
-            finally { Pdfium.FPDFPage_CloseAnnot(annot); }
+            finally
+            {
+                Pdfium.FPDFPage_CloseAnnot(annot);
+            }
             return 0;
         }), 32);
     }
-    public IReadOnlyList<PdfComment> GetComments()
+
+    /// <summary>Review annotations of the whole document, or of one page after a page-local change.</summary>
+    public IReadOnlyList<PdfComment> GetComments(int? pageIndex = null)
     {
         lock (Gate)
         {
+            EnsureOpen();
             var result = new List<PdfComment>();
-            for (var i = 0; i < PageCount; i++)
+            var pages = pageIndex is { } single ? [single] : Enumerable.Range(0, NativePageCount);
+            foreach (var index in pages)
             {
-                var pageIndex = i;
-                OnPage(i, page =>
+                OnPage(index, page =>
                 {
                     for (var a = 0; a < Pdfium.FPDFPage_GetAnnotCount(page); a++)
                     {
@@ -627,11 +1001,14 @@ public sealed class PdfDocument : IDisposable
                         try
                         {
                             var type = Pdfium.FPDFAnnot_GetSubtype(annot);
-                            if (type is not (1 or 9)) continue;
-                            result.Add(new(pageIndex, a, ReadString((b, n) => Pdfium.FPDFAnnot_GetStringValue(annot, "Contents", b, n)),
+                            if (!PdfComment.MarkupTypes.Contains(type)) continue;
+                            result.Add(new(index, a, ReadString((b, n) => Pdfium.FPDFAnnot_GetStringValue(annot, "Contents", b, n)),
                                 ReadString((b, n) => Pdfium.FPDFAnnot_GetStringValue(annot, "T", b, n)), type));
                         }
-                        finally { Pdfium.FPDFPage_CloseAnnot(annot); }
+                        finally
+                        {
+                            Pdfium.FPDFPage_CloseAnnot(annot);
+                        }
                     }
                     return 0;
                 });
@@ -639,13 +1016,36 @@ public sealed class PdfDocument : IDisposable
             return result;
         }
     }
-    public void DeleteComment(PdfComment comment) => Edit(() => OnPage(comment.PageIndex, p =>
+
+    public void DeleteComment(PdfComment comment) => Edit(() => OnPage(comment.PageIndex, page =>
     {
-        if (Pdfium.FPDFPage_RemoveAnnot(p, comment.AnnotationIndex) == 0) throw new InvalidOperationException("Не удалось удалить аннотацию.");
+        var annot = Pdfium.FPDFPage_GetAnnot(page, comment.AnnotationIndex);
+        if (annot == 0) throw new InvalidOperationException("Аннотация больше не существует.");
+        var popupIndex = -1;
+        try
+        {
+            var current = new PdfComment(comment.PageIndex, comment.AnnotationIndex,
+                ReadString((b, n) => Pdfium.FPDFAnnot_GetStringValue(annot, "Contents", b, n)),
+                ReadString((b, n) => Pdfium.FPDFAnnot_GetStringValue(annot, "T", b, n)), Pdfium.FPDFAnnot_GetSubtype(annot));
+            if (current != comment) throw new InvalidOperationException("Аннотации изменились. Выберите аннотацию заново.");
+            // The popup window of a markup annotation is a separate annotation; remove it as well.
+            var popup = Pdfium.FPDFAnnot_GetLinkedAnnot(annot, "Popup");
+            if (popup != 0)
+            {
+                popupIndex = Pdfium.FPDFPage_GetAnnotIndex(page, popup);
+                Pdfium.FPDFPage_CloseAnnot(popup);
+            }
+        }
+        finally
+        {
+            Pdfium.FPDFPage_CloseAnnot(annot);
+        }
+        foreach (var index in new[] { comment.AnnotationIndex, popupIndex }.Where(i => i >= 0).Distinct().OrderDescending())
+            if (Pdfium.FPDFPage_RemoveAnnot(page, index) == 0) throw new InvalidOperationException("Не удалось удалить аннотацию.");
         return 0;
     }), 32);
 
-    private static byte[] Serialize(nint document)
+    private static byte[] Serialize(nint document, uint flags)
     {
         using var stream = new MemoryStream();
         Exception? failure = null;
@@ -653,29 +1053,92 @@ public sealed class PdfDocument : IDisposable
         {
             try
             {
-                var buffer = new byte[checked((int)size)]; Marshal.Copy(pointer, buffer, 0, buffer.Length); stream.Write(buffer); return 1;
+                var buffer = new byte[checked((int)size)];
+                Marshal.Copy(pointer, buffer, 0, buffer.Length);
+                stream.Write(buffer);
+                return 1;
             }
-            catch (Exception ex) { failure = ex; return 0; } // Exceptions must never cross the native callback boundary.
+            catch (Exception ex)
+            {
+                failure = ex; // Exceptions must never cross the native callback boundary.
+                return 0;
+            }
         };
         var writer = new Pdfium.FileWrite { Version = 1, Callback = Marshal.GetFunctionPointerForDelegate(callback) };
-        var success = Pdfium.FPDF_SaveAsCopy(document, ref writer, 2); // Preserve security; rewrite all contents (no old deleted text).
+        // Rewrite keeps security and drops unreferenced objects; incremental appends changes to the original bytes.
+        var success = Pdfium.FPDF_SaveAsCopy(document, ref writer, flags);
         GC.KeepAlive(callback);
         if (failure is not null) throw new IOException("Не удалось сериализовать PDF.", failure);
         if (success == 0) throw new IOException("PDFium не смог сохранить документ.");
         return stream.ToArray();
     }
-    public byte[] GetBytes() { lock (Gate) { EnsureOpen(); return Serialize(_handle); } }
-    public void Save(string path)
+
+    /// <summary>Current PDF bytes. The array may be shared with the document and must not be modified.</summary>
+    public byte[] GetBytes()
     {
         lock (Gate)
         {
-            EnsureOpen(); path = Path.GetFullPath(path);
-            if (string.Equals(FilePath, path, StringComparison.OrdinalIgnoreCase) && _diskHash is not null &&
-                (!File.Exists(path) || !SHA256.HashData(File.ReadAllBytes(path)).SequenceEqual(_diskHash)))
-                throw new IOException("Исходный файл изменён или удалён другой программой. Сохраните документ под другим именем.");
-            var bytes = Serialize(_handle);
-            AtomicFile.Write(path, bytes);
-            FilePath = path; _diskHash = SHA256.HashData(bytes); _savedState = _state;
+            EnsureOpen();
+            return CurrentBytes();
         }
+    }
+
+    public RecoverySnapshot GetRecoverySnapshot()
+    {
+        lock (Gate)
+        {
+            EnsureOpen();
+            return new(CurrentBytes(), FilePath, _diskHash, Revision);
+        }
+    }
+
+    /// <summary>Best effort for crash handlers: gives up instead of waiting forever for a thread that holds the lock.</summary>
+    public RecoverySnapshot? TryGetRecoverySnapshot(TimeSpan timeout)
+    {
+        if (!Monitor.TryEnter(Gate, timeout)) return null;
+        try
+        {
+            return _handle == 0 ? null : new(CurrentBytes(), FilePath, _diskHash, Revision);
+        }
+        finally
+        {
+            Monitor.Exit(Gate);
+        }
+    }
+
+    public void Save(string path)
+    {
+        path = Path.GetFullPath(path);
+        byte[] bytes;
+        long state;
+        byte[]? expectedHash;
+        string? currentPath;
+        lock (Gate)
+        {
+            EnsureOpen();
+            bytes = CurrentBytes();
+            state = _state;
+            expectedHash = _diskHash;
+            currentPath = FilePath;
+        }
+        // File I/O runs outside the lock so rendering of other pages and documents continues.
+        if (string.Equals(currentPath, path, StringComparison.OrdinalIgnoreCase) && expectedHash is not null && !FileMatches(path, expectedHash))
+            throw new IOException("Исходный файл изменён или удалён другой программой. Сохраните документ под другим именем.");
+        AtomicFile.Write(path, bytes);
+        var hash = SHA256.HashData(bytes);
+        lock (Gate)
+        {
+            FilePath = path;
+            _diskHash = hash;
+            _savedState = state;
+            Publish();
+        }
+    }
+
+    private static bool FileMatches(string path, byte[] hash)
+    {
+        if (!File.Exists(path)) return false;
+        using var stream = File.OpenRead(path);
+        return SHA256.HashData(stream).SequenceEqual(hash);
     }
 }

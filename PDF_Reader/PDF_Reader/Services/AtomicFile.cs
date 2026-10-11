@@ -11,11 +11,17 @@ public static class AtomicFile
         try
         {
             using (var file = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-            { file.Write(bytes); file.Flush(flushToDisk: true); }
+            {
+                file.Write(bytes);
+                file.Flush(flushToDisk: true);
+            }
             // Replacement is atomic on NTFS; the original survives any failure before this step.
             if (File.Exists(path)) File.Replace(temporary, path, null);
             else File.Move(temporary, path);
         }
-        finally { if (File.Exists(temporary)) File.Delete(temporary); }
+        finally
+        {
+            if (File.Exists(temporary)) File.Delete(temporary);
+        }
     }
 }

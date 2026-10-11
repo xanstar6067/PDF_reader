@@ -12,14 +12,25 @@ foreach ($size in $sizes) {
     $graphics.SmoothingMode = [Drawing.Drawing2D.SmoothingMode]::AntiAlias
     $graphics.Clear([Drawing.Color]::Transparent)
     $brush = [Drawing.SolidBrush]::new([Drawing.Color]::FromArgb(215, 53, 50))
-    $graphics.FillRectangle($brush, 0, 0, $size, $size)
-    $pen = [Drawing.Pen]::new([Drawing.Color]::White, [single]($size / 18))
-    $graphics.DrawRectangle($pen, [single]($size * .25), [single]($size * .16), [single]($size * .5), [single]($size * .68))
-    foreach ($line in @(.42, .55, .68)) { $graphics.DrawLine($pen, [single]($size * .36), [single]($size * $line), [single]($size * .64), [single]($size * $line)) }
+    $path = [Drawing.Drawing2D.GraphicsPath]::new()
+    $diameter = [single]($size * .4)
+    $edge = [single]($size - 1)
+    $path.AddArc(0, 0, $diameter, $diameter, 180, 90)
+    $path.AddArc(($edge - $diameter), 0, $diameter, $diameter, 270, 90)
+    $path.AddArc(($edge - $diameter), ($edge - $diameter), $diameter, $diameter, 0, 90)
+    $path.AddArc(0, ($edge - $diameter), $diameter, $diameter, 90, 90)
+    $path.CloseFigure()
+    $graphics.FillPath($brush, $path)
+    $graphics.TextRenderingHint = [Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+    $font = [Drawing.Font]::new('Segoe UI', [single]($size * .34), [Drawing.FontStyle]::Bold, [Drawing.GraphicsUnit]::Pixel)
+    $format = [Drawing.StringFormat]::new()
+    $format.Alignment = [Drawing.StringAlignment]::Center
+    $format.LineAlignment = [Drawing.StringAlignment]::Center
+    $graphics.DrawString('PDF', $font, [Drawing.Brushes]::White, [Drawing.RectangleF]::new(0, 0, $edge, $edge), $format)
     $stream = [IO.MemoryStream]::new()
     $bitmap.Save($stream, [Drawing.Imaging.ImageFormat]::Png)
     $images += ,($stream.ToArray())
-    $stream.Dispose(); $pen.Dispose(); $brush.Dispose(); $graphics.Dispose(); $bitmap.Dispose()
+    $stream.Dispose(); $format.Dispose(); $font.Dispose(); $path.Dispose(); $brush.Dispose(); $graphics.Dispose(); $bitmap.Dispose()
 }
 $file = [IO.File]::Create((Join-Path $assetDirectory 'paperdesk.ico'))
 $writer = [IO.BinaryWriter]::new($file)
