@@ -22,12 +22,14 @@ public sealed class TextInputWindow : Window
         SizeToContent = SizeToContent.Height;
         ResizeMode = ResizeMode.NoResize;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
-        Background = System.Windows.Media.Brushes.White;
+        SourceInitialized += (_, _) => PDF_Reader.Services.ThemeService.UpdateTitleBar(this);
         _secret = password;
 
         var panel = new StackPanel { Margin = new Thickness(28) };
         panel.Children.Add(new TextBlock { Text = title, FontSize = 22, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 12) });
-        panel.Children.Add(new TextBlock { Text = description, TextWrapping = TextWrapping.Wrap, Foreground = System.Windows.Media.Brushes.DimGray, Margin = new Thickness(0, 0, 0, 18) });
+        var descriptionBlock = new TextBlock { Text = description, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 18) };
+        descriptionBlock.SetResourceReference(TextBlock.ForegroundProperty, "Muted");
+        panel.Children.Add(descriptionBlock);
         _text = new TextBox
         {
             Text = value,
@@ -59,7 +61,7 @@ public sealed class TextInputWindow : Window
         {
             if (_size is not null && !IsValidSize(_size.Text))
             {
-                MessageBox.Show(this, "Введите размер шрифта от 4 до 200 пт.");
+                MessageWindow.Show(this, "Введите размер шрифта от 4 до 200 пт.", "Размер шрифта");
                 return;
             }
             DialogResult = true;

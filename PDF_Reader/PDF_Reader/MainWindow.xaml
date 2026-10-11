@@ -6,7 +6,7 @@
         Title="{Binding WindowTitle}"
         Width="1480" Height="980" MinWidth="1100" MinHeight="680"
         WindowStartupLocation="CenterScreen"
-        Background="#F6F7F9"
+        Background="{DynamicResource WindowBackground}"
         AllowDrop="True"
         DragOver="Window_DragOver"
         Drop="Window_Drop"
@@ -37,7 +37,7 @@
         </Grid.RowDefinitions>
 
         <!-- Menu -->
-        <Border Background="White" BorderBrush="{StaticResource Line}" BorderThickness="0,0,0,1">
+        <Border Background="{DynamicResource Surface}" BorderBrush="{DynamicResource Line}" BorderThickness="0,0,0,1">
             <DockPanel>
                 <Button DockPanel.Dock="Right" Content="Приложение по умолчанию" Command="{Binding DefaultAppCommand}"
                         Style="{StaticResource ToolbarButton}" FontSize="12" Margin="12,3"/>
@@ -71,6 +71,12 @@
                         <MenuItem Header="Найти" Command="{Binding FindCommand}" InputGestureText="Ctrl+F"/>
                     </MenuItem>
                     <MenuItem Header="_Вид">
+                        <MenuItem Header="Тема оформления">
+                            <MenuItem x:Name="SystemThemeMenu" Header="Как в Windows" Tag="System" Click="Theme_Click"/>
+                            <MenuItem x:Name="LightThemeMenu" Header="Светлая" Tag="Light" Click="Theme_Click"/>
+                            <MenuItem x:Name="DarkThemeMenu" Header="Тёмная" Tag="Dark" Click="Theme_Click"/>
+                        </MenuItem>
+                        <Separator/>
                         <MenuItem Header="По ширине" Command="{Binding FitWidthCommand}" InputGestureText="Ctrl+0"/>
                         <MenuItem Header="Фактический размер" Command="{Binding ActualSizeCommand}" InputGestureText="Ctrl+1"/>
                         <MenuItem Header="Полноэкранный режим" Click="FullScreen_Click" InputGestureText="F11"/>
@@ -91,7 +97,7 @@
         </Border>
 
         <!-- Brand and document tabs -->
-        <Border Grid.Row="1" Background="White" BorderBrush="{StaticResource Line}" BorderThickness="0,0,0,1">
+        <Border Grid.Row="1" Background="{DynamicResource Surface}" BorderBrush="{DynamicResource Line}" BorderThickness="0,0,0,1">
             <Grid Height="64">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="240"/>
@@ -99,17 +105,17 @@
                     <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="22,0">
-                    <Border Background="{StaticResource Accent}" CornerRadius="8" Width="36" Height="38">
+                    <Border Background="#C42B1C" CornerRadius="8" Width="36" Height="38">
                         <TextBlock Text="PDF" FontSize="12" Foreground="White" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Center"/>
                     </Border>
                     <StackPanel Margin="12,0,0,0">
                         <TextBlock Text="PaperDesk" FontSize="20" FontWeight="SemiBold"/>
-                        <TextBlock Text="ВАШЕ ПРОСТРАНСТВО ДЛЯ PDF" FontSize="8" Foreground="{StaticResource Muted}"/>
+                        <TextBlock Text="ВАШЕ ПРОСТРАНСТВО ДЛЯ PDF" FontSize="8" Foreground="{DynamicResource Muted}"/>
                     </StackPanel>
                 </StackPanel>
                 <ListBox Grid.Column="1" ItemsSource="{Binding Documents}" SelectedItem="{Binding ActiveTab}"
                          IsEnabled="{Binding IsBusy, Converter={StaticResource Not}}"
-                         BorderThickness="0" Background="White"
+                         BorderThickness="0" Background="{DynamicResource Surface}"
                          ScrollViewer.HorizontalScrollBarVisibility="Auto" ScrollViewer.VerticalScrollBarVisibility="Disabled">
                     <ListBox.ItemsPanel>
                         <ItemsPanelTemplate>
@@ -124,12 +130,12 @@
                             <Setter Property="Template">
                                 <Setter.Value>
                                     <ControlTemplate TargetType="ListBoxItem">
-                                        <Border x:Name="Tab" CornerRadius="7" Background="#F7F8FA" Padding="12,8">
+                                        <Border x:Name="Tab" CornerRadius="7" Background="{DynamicResource Subtle}" Padding="12,8">
                                             <ContentPresenter/>
                                         </Border>
                                         <ControlTemplate.Triggers>
                                             <Trigger Property="IsSelected" Value="True">
-                                                <Setter TargetName="Tab" Property="Background" Value="#EDEFF4"/>
+                                                <Setter TargetName="Tab" Property="Background" Value="{DynamicResource Hover}"/>
                                             </Trigger>
                                         </ControlTemplate.Triggers>
                                     </ControlTemplate>
@@ -140,7 +146,7 @@
                     <ListBox.ItemTemplate>
                         <DataTemplate>
                             <StackPanel Orientation="Horizontal">
-                                <TextBlock Text="&#xE8A5;" Style="{StaticResource Icon}" Foreground="{StaticResource Accent}" Margin="0,0,8,0"/>
+                                <TextBlock Text="&#xE8A5;" Style="{StaticResource Icon}" Foreground="{DynamicResource Accent}" Margin="0,0,8,0"/>
                                 <TextBlock Text="{Binding Title}" MaxWidth="210" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" ToolTip="{Binding Path}"/>
                                 <Button Content="×" Tag="{Binding}" Click="CloseTab_Click" Style="{StaticResource ToolbarButton}"
                                         Padding="6,1" Margin="10,0,0,0" ToolTip="Закрыть"/>
@@ -153,7 +159,7 @@
         </Border>
 
         <!-- Document toolbar -->
-        <Border Grid.Row="2" Background="White" BorderBrush="{StaticResource Line}" BorderThickness="0,0,0,1"
+        <Border Grid.Row="2" Background="{DynamicResource Surface}" BorderBrush="{DynamicResource Line}" BorderThickness="0,0,0,1"
                 Visibility="{Binding HasDocument, Converter={StaticResource Visible}}">
             <DockPanel Height="56" Margin="15,0">
                 <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
@@ -163,7 +169,7 @@
                     <Button Command="{Binding RotateCommand}" ToolTip="Повернуть страницу" Style="{StaticResource ToolbarButton}">
                         <TextBlock Text="&#xE7AD;" Style="{StaticResource Icon}"/>
                     </Button>
-                    <Border Width="1" Height="24" Background="{StaticResource Line}" Margin="9,0"/>
+                    <Border Width="1" Height="24" Background="{DynamicResource Line}" Margin="9,0"/>
                     <Button Command="{Binding ZoomOutCommand}" ToolTip="Уменьшить" Style="{StaticResource ToolbarButton}">
                         <TextBlock Text="&#xE738;" Style="{StaticResource Icon}"/>
                     </Button>
@@ -182,20 +188,20 @@
                     <Button Command="{Binding PrintCommand}" ToolTip="Печать (Ctrl+P)" Style="{StaticResource ToolbarButton}">
                         <TextBlock Text="&#xE749;" Style="{StaticResource Icon}"/>
                     </Button>
-                    <Border Width="1" Height="24" Background="{StaticResource Line}" Margin="10,0"/>
+                    <Border Width="1" Height="24" Background="{DynamicResource Line}" Margin="10,0"/>
                     <Button Command="{Binding UndoCommand}" ToolTip="Отменить (Ctrl+Z)" Style="{StaticResource ToolbarButton}">
                         <TextBlock Text="&#xE7A7;" Style="{StaticResource Icon}"/>
                     </Button>
                     <Button Command="{Binding RedoCommand}" ToolTip="Повторить (Ctrl+Y)" Style="{StaticResource ToolbarButton}">
                         <TextBlock Text="&#xE7A6;" Style="{StaticResource Icon}"/>
                     </Button>
-                    <Border Width="1" Height="24" Background="{StaticResource Line}" Margin="10,0"/>
+                    <Border Width="1" Height="24" Background="{DynamicResource Line}" Margin="10,0"/>
                     <Button Command="{Binding PreviousPageCommand}" ToolTip="Предыдущая страница" Style="{StaticResource ToolbarButton}">
                         <TextBlock Text="&#xE70E;" Style="{StaticResource Icon}"/>
                     </Button>
                     <TextBox Width="48" Text="{Binding CurrentPage, UpdateSourceTrigger=LostFocus}" TextAlignment="Center" Padding="4,5"
                              IsEnabled="{Binding CanInteract}" ToolTip="Номер страницы"/>
-                    <TextBlock Text=" / " VerticalAlignment="Center" Foreground="{StaticResource Muted}"/>
+                    <TextBlock Text=" / " VerticalAlignment="Center" Foreground="{DynamicResource Muted}"/>
                     <TextBlock Text="{Binding PageCount}" VerticalAlignment="Center" Margin="0,0,6,0"/>
                     <Button Command="{Binding NextPageCommand}" ToolTip="Следующая страница" Style="{StaticResource ToolbarButton}">
                         <TextBlock Text="&#xE70D;" Style="{StaticResource Icon}"/>
@@ -213,10 +219,10 @@
                 <ColumnDefinition Width="230"/>
             </Grid.ColumnDefinitions>
 
-            <Border Background="White" BorderBrush="{StaticResource Line}" BorderThickness="0,0,1,0">
-                <TabControl SelectedIndex="{Binding NavigationTab}" BorderThickness="0" Background="White" Padding="0">
+            <Border Background="{DynamicResource Surface}" BorderBrush="{DynamicResource Line}" BorderThickness="0,0,1,0">
+                <TabControl SelectedIndex="{Binding NavigationTab}" BorderThickness="0" Background="{DynamicResource Surface}" Padding="0">
                     <TabItem Header="Стр.">
-                        <ListBox x:Name="ThumbnailList" ItemsSource="{Binding Pages}" BorderThickness="0" Background="#FAFBFC"
+                        <ListBox x:Name="ThumbnailList" ItemsSource="{Binding Pages}" BorderThickness="0" Background="{DynamicResource Subtle}"
                                  SelectionChanged="Thumbnails_SelectionChanged"
                                  ScrollViewer.CanContentScroll="True"
                                  VirtualizingPanel.IsVirtualizing="True"
@@ -225,11 +231,11 @@
                             <ListBox.ItemTemplate>
                                 <DataTemplate>
                                     <StackPanel Margin="38,12" ToolTip="{Binding Number}">
-                                        <Border BorderBrush="#D7DAE1" BorderThickness="1">
+                                        <Border BorderBrush="{DynamicResource Line}" BorderThickness="1">
                                             <c:PdfPageControl Item="{Binding}" Version="{Binding Version}" Thumbnail="True"
                                                               Width="158" Height="{Binding ThumbnailHeight}"/>
                                         </Border>
-                                        <TextBlock Text="{Binding Label}" HorizontalAlignment="Center" Foreground="{StaticResource Muted}" Margin="0,9,0,0"/>
+                                        <TextBlock Text="{Binding Label}" HorizontalAlignment="Center" Foreground="{DynamicResource Muted}" Margin="0,9,0,0"/>
                                     </StackPanel>
                                 </DataTemplate>
                             </ListBox.ItemTemplate>
@@ -245,7 +251,7 @@
                                 </TreeView.ItemTemplate>
                             </TreeView>
                             <TextBlock Text="В этом документе нет оглавления.&#x0a;Главы появятся здесь, если автор добавил закладки в PDF."
-                                       TextWrapping="Wrap" Foreground="{StaticResource Muted}" Margin="12,30">
+                                       TextWrapping="Wrap" Foreground="{DynamicResource Muted}" Margin="12,30">
                                 <TextBlock.Style>
                                     <Style TargetType="TextBlock">
                                         <Setter Property="Visibility" Value="Collapsed"/>
@@ -277,7 +283,7 @@
                                     <Button Content="‹" Command="{Binding PreviousMatchCommand}" Padding="7,2" Margin="4,0"/>
                                     <Button Content="›" Command="{Binding NextMatchCommand}" Padding="7,2"/>
                                 </StackPanel>
-                                <TextBlock Text="{Binding SearchSummary}" Foreground="{StaticResource Muted}" FontSize="11" VerticalAlignment="Center"/>
+                                <TextBlock Text="{Binding SearchSummary}" Foreground="{DynamicResource Muted}" FontSize="11" VerticalAlignment="Center"/>
                             </DockPanel>
                             <ListBox Grid.Row="3" ItemsSource="{Binding Matches}" SelectedItem="{Binding SelectedMatch}" BorderThickness="0"
                                      HorizontalContentAlignment="Stretch" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
@@ -285,7 +291,7 @@
                                 <ListBox.ItemTemplate>
                                     <DataTemplate>
                                         <StackPanel Margin="3,8">
-                                            <TextBlock Text="{Binding PageNumber, StringFormat=Страница {0}}" Foreground="{StaticResource Accent}" FontWeight="SemiBold" FontSize="11"/>
+                                            <TextBlock Text="{Binding PageNumber, StringFormat=Страница {0}}" Foreground="{DynamicResource Accent}" FontWeight="SemiBold" FontSize="11"/>
                                             <TextBlock Text="{Binding Preview}" TextWrapping="Wrap" Margin="0,5,0,0"/>
                                         </StackPanel>
                                     </DataTemplate>
@@ -299,28 +305,28 @@
                                      SelectionChanged="Comments_SelectionChanged" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
                                 <ListBox.ItemTemplate>
                                     <DataTemplate>
-                                        <Border Background="#FFF9E7" CornerRadius="7" Padding="12" Margin="0,5">
+                                        <Border Background="{DynamicResource Comment}" CornerRadius="7" Padding="12" Margin="0,5">
                                             <StackPanel>
                                                 <DockPanel>
                                                     <Button DockPanel.Dock="Right" Content="×" Tag="{Binding}" Click="DeleteComment_Click" Padding="5,0"
                                                             Style="{StaticResource ToolbarButton}" ToolTip="Удалить аннотацию"/>
-                                                    <Ellipse Width="10" Height="10" Margin="0,0,8,0" VerticalAlignment="Center" Stroke="#33000000">
+                                                    <Ellipse Width="10" Height="10" Margin="0,0,8,0" VerticalAlignment="Center" Stroke="{DynamicResource Muted}">
                                                         <Ellipse.Fill>
                                                             <SolidColorBrush Color="{Binding Color}"/>
                                                         </Ellipse.Fill>
                                                     </Ellipse>
                                                     <TextBlock Text="{Binding Kind}" FontWeight="SemiBold"/>
                                                 </DockPanel>
-                                                <TextBlock Text="{Binding PageNumber, StringFormat=Страница {0}}" Foreground="{StaticResource Muted}" FontSize="11" Margin="0,6"/>
+                                                <TextBlock Text="{Binding PageNumber, StringFormat=Страница {0}}" Foreground="{DynamicResource Muted}" FontSize="11" Margin="0,6"/>
                                                 <TextBlock Text="{Binding Text}" TextWrapping="Wrap"/>
-                                                <TextBlock Text="{Binding Author}" Foreground="{StaticResource Muted}" FontSize="10" Margin="0,8,0,0"/>
+                                                <TextBlock Text="{Binding Author}" Foreground="{DynamicResource Muted}" FontSize="10" Margin="0,8,0,0"/>
                                             </StackPanel>
                                         </Border>
                                     </DataTemplate>
                                 </ListBox.ItemTemplate>
                             </ListBox>
                             <TextBlock Text="Заметки, выделения и другие аннотации появятся здесь. Используйте инструменты справа."
-                                       TextWrapping="Wrap" Foreground="{StaticResource Muted}" Margin="12,30">
+                                       TextWrapping="Wrap" Foreground="{DynamicResource Muted}" Margin="12,30">
                                 <TextBlock.Style>
                                     <Style TargetType="TextBlock">
                                         <Setter Property="Visibility" Value="Collapsed"/>
@@ -337,9 +343,9 @@
                 </TabControl>
             </Border>
 
-            <GridSplitter Grid.Column="1" Width="5" HorizontalAlignment="Stretch" Background="#ECEEF2"/>
+            <GridSplitter Grid.Column="1" Width="5" HorizontalAlignment="Stretch" Background="{DynamicResource Line}"/>
 
-            <ListBox x:Name="PageList" Grid.Column="2" ItemsSource="{Binding Pages}" BorderThickness="0" Background="#E7E9EE"
+            <ListBox x:Name="PageList" Grid.Column="2" ItemsSource="{Binding Pages}" BorderThickness="0" Background="{DynamicResource Workspace}"
                      ItemContainerStyle="{StaticResource PageListItem}"
                      ScrollViewer.HorizontalScrollBarVisibility="Auto"
                      ScrollViewer.VerticalScrollBarVisibility="Auto"
@@ -354,21 +360,21 @@
                 <ListBox.ItemTemplate>
                     <DataTemplate>
                         <StackPanel>
-                            <Border Background="White" BorderBrush="#CED2DB" BorderThickness="1">
+                            <Border Background="White" BorderBrush="{DynamicResource Line}" BorderThickness="1">
                                 <c:PdfPageControl Item="{Binding}" Version="{Binding Version}" Width="{Binding Width}" Height="{Binding Height}"
                                                   Match="{Binding DataContext.SelectedMatch, RelativeSource={RelativeSource AncestorType=Window}}"
                                                   MatchesVersion="{Binding DataContext.MatchesVersion, RelativeSource={RelativeSource AncestorType=Window}}"
                                                   SelectedAnnotation="{Binding DataContext.SelectedAnnotation, RelativeSource={RelativeSource AncestorType=Window}}"
                                                   Workspace="{Binding DataContext, RelativeSource={RelativeSource AncestorType=Window}}"/>
                             </Border>
-                            <TextBlock Text="{Binding Label}" FontSize="11" Foreground="#828997" HorizontalAlignment="Center" Margin="0,10,0,0"/>
+                            <TextBlock Text="{Binding Label}" FontSize="11" Foreground="{DynamicResource Muted}" HorizontalAlignment="Center" Margin="0,10,0,0"/>
                         </StackPanel>
                     </DataTemplate>
                 </ListBox.ItemTemplate>
             </ListBox>
 
             <!-- Tools -->
-            <Border Grid.Column="3" Background="White" BorderBrush="{StaticResource Line}" BorderThickness="1,0,0,0">
+            <Border Grid.Column="3" Background="{DynamicResource Surface}" BorderBrush="{DynamicResource Line}" BorderThickness="1,0,0,0">
                 <ScrollViewer VerticalScrollBarVisibility="Auto">
                     <StackPanel Margin="18,22">
                         <TextBlock Text="Инструменты" FontSize="16" FontWeight="SemiBold" Margin="9,0,0,6"/>
@@ -453,7 +459,7 @@
                                  Style="{StaticResource ChoiceList}" IsEnabled="{Binding CanInteract}">
                             <ListBox.ItemTemplate>
                                 <DataTemplate>
-                                    <Ellipse Width="20" Height="20" Stroke="#33000000">
+                                    <Ellipse Width="20" Height="20" Stroke="{DynamicResource Muted}">
                                         <Ellipse.Fill>
                                             <SolidColorBrush Color="{Binding}"/>
                                         </Ellipse.Fill>
@@ -467,27 +473,27 @@
                             <ListBox.ItemTemplate>
                                 <DataTemplate>
                                     <Grid Width="26" Height="20" ToolTip="{Binding StringFormat={}{0} пт}">
-                                        <Rectangle Height="{Binding}" Fill="{StaticResource Ink}" VerticalAlignment="Center" RadiusX="1" RadiusY="1"/>
+                                        <Rectangle Height="{Binding}" Fill="{DynamicResource Ink}" VerticalAlignment="Center" RadiusX="1" RadiusY="1"/>
                                     </Grid>
                                 </DataTemplate>
                             </ListBox.ItemTemplate>
                         </ListBox>
 
-                        <Border Background="#F2F6FD" CornerRadius="8" Padding="12" Margin="4,16,4,0"
+                        <Border Background="{DynamicResource Info}" CornerRadius="8" Padding="12" Margin="4,16,4,0"
                                 Visibility="{Binding HasSelectedAnnotation, Converter={StaticResource Visible}}">
                             <StackPanel>
                                 <TextBlock Text="Выбранная аннотация" FontWeight="SemiBold"/>
-                                <TextBlock Text="{Binding SelectedAnnotationSummary}" TextWrapping="Wrap" Foreground="{StaticResource Muted}" FontSize="12" Margin="0,4,0,10"/>
+                                <TextBlock Text="{Binding SelectedAnnotationSummary}" TextWrapping="Wrap" Foreground="{DynamicResource Muted}" FontSize="12" Margin="0,4,0,10"/>
                                 <WrapPanel>
                                     <Button Content="Комментарий…" Command="{Binding EditAnnotationTextCommand}" Padding="8,5" Margin="0,0,6,6" FontSize="12"
                                             ToolTip="Двойной щелчок по аннотации"/>
                                     <Button Content="Удалить" Command="{Binding DeleteAnnotationCommand}" Padding="8,5" Margin="0,0,0,6" FontSize="12"
-                                            Foreground="#B6403A" ToolTip="Delete"/>
+                                            Foreground="{DynamicResource Danger}" ToolTip="Delete"/>
                                 </WrapPanel>
                             </StackPanel>
                         </Border>
 
-                        <Border Height="1" Background="{StaticResource Line}" Margin="8,20"/>
+                        <Border Height="1" Background="{DynamicResource Line}" Margin="8,20"/>
                         <TextBlock Text="Страницы" FontWeight="SemiBold" Margin="10,0,0,12"/>
                         <Button Content="Повернуть на 90°" Command="{Binding RotateCommand}" Style="{StaticResource ToolbarButton}" HorizontalContentAlignment="Left"/>
                         <Button Content="Добавить страницу" Command="{Binding InsertPageCommand}" Style="{StaticResource ToolbarButton}" HorizontalContentAlignment="Left"/>
@@ -498,9 +504,9 @@
                             <Button Content="Ниже" Command="{Binding MovePageDownCommand}" Padding="12,7"/>
                         </StackPanel>
                         <Button Content="Удалить страницу" Command="{Binding DeletePageCommand}" Style="{StaticResource ToolbarButton}"
-                                HorizontalContentAlignment="Left" Foreground="#B6403A"/>
-                        <Border Background="#F6F7FA" CornerRadius="8" Padding="13" Margin="4,25,4,0">
-                            <TextBlock Text="{Binding ToolHint}" TextWrapping="Wrap" Foreground="{StaticResource Muted}" FontSize="12"/>
+                                HorizontalContentAlignment="Left" Foreground="{DynamicResource Danger}"/>
+                        <Border Background="{DynamicResource Subtle}" CornerRadius="8" Padding="13" Margin="4,25,4,0">
+                            <TextBlock Text="{Binding ToolHint}" TextWrapping="Wrap" Foreground="{DynamicResource Muted}" FontSize="12"/>
                         </Border>
                     </StackPanel>
                 </ScrollViewer>
@@ -518,20 +524,20 @@
                 <StackPanel Margin="0,20,60,0">
                     <TextBlock Text="Документы.&#x0a;Всё под рукой." FontSize="44" FontWeight="SemiBold" LineHeight="55"/>
                     <TextBlock Text="Открывайте, читайте и редактируйте PDF в одном рабочем пространстве." TextWrapping="Wrap"
-                               Foreground="{StaticResource Muted}" FontSize="17" Margin="0,22,0,30" MaxWidth="460" HorizontalAlignment="Left"/>
+                               Foreground="{DynamicResource Muted}" FontSize="17" Margin="0,22,0,30" MaxWidth="460" HorizontalAlignment="Left"/>
                     <StackPanel Orientation="Horizontal">
                         <Button Content="Открыть документ" Command="{Binding OpenCommand}" Style="{StaticResource AccentButton}" Padding="24,13"/>
                         <Button Content="Создать PDF" Command="{Binding NewCommand}" Margin="12,0" Padding="20,13"/>
                     </StackPanel>
-                    <Border Background="White" CornerRadius="10" Padding="24" Margin="0,36,0,0" BorderBrush="{StaticResource Line}" BorderThickness="1">
+                    <Border Background="{DynamicResource Surface}" CornerRadius="10" Padding="24" Margin="0,36,0,0" BorderBrush="{DynamicResource Line}" BorderThickness="1">
                         <StackPanel>
                             <TextBlock Text="Перетащите PDF в это окно" FontSize="16" FontWeight="SemiBold"/>
-                            <TextBlock Text="Или нажмите Ctrl+O, чтобы выбрать файл" Foreground="{StaticResource Muted}" Margin="0,9,0,0"/>
+                            <TextBlock Text="Или нажмите Ctrl+O, чтобы выбрать файл" Foreground="{DynamicResource Muted}" Margin="0,9,0,0"/>
                         </StackPanel>
                     </Border>
-                    <TextBlock Text="ПРОСМОТР     РЕДАКТИРОВАНИЕ     ПЕЧАТЬ" Foreground="{StaticResource Muted}" FontSize="10" Margin="0,30,0,0"/>
+                    <TextBlock Text="ПРОСМОТР     РЕДАКТИРОВАНИЕ     ПЕЧАТЬ" Foreground="{DynamicResource Muted}" FontSize="10" Margin="0,30,0,0"/>
                 </StackPanel>
-                <Border Grid.Column="1" Background="White" BorderBrush="{StaticResource Line}" BorderThickness="1" CornerRadius="12" Padding="26" VerticalAlignment="Top">
+                <Border Grid.Column="1" Background="{DynamicResource Surface}" BorderBrush="{DynamicResource Line}" BorderThickness="1" CornerRadius="12" Padding="26" VerticalAlignment="Top">
                     <StackPanel>
                         <TextBlock Text="Недавние документы" FontSize="19" FontWeight="SemiBold" Margin="0,0,0,20"/>
                         <ItemsControl ItemsSource="{Binding RecentFiles}">
@@ -544,10 +550,10 @@
                                                 <ColumnDefinition Width="38"/>
                                                 <ColumnDefinition Width="*"/>
                                             </Grid.ColumnDefinitions>
-                                            <TextBlock Text="&#xE8A5;" Style="{StaticResource Icon}" Foreground="{StaticResource Accent}"/>
+                                            <TextBlock Text="&#xE8A5;" Style="{StaticResource Icon}" Foreground="{DynamicResource Accent}"/>
                                             <StackPanel Grid.Column="1">
                                                 <TextBlock Text="{Binding Name}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
-                                                <TextBlock Text="{Binding Folder}" Foreground="{StaticResource Muted}" FontSize="11"
+                                                <TextBlock Text="{Binding Folder}" Foreground="{DynamicResource Muted}" FontSize="11"
                                                            TextTrimming="CharacterEllipsis" Margin="0,5,0,0"/>
                                             </StackPanel>
                                         </Grid>
@@ -555,7 +561,7 @@
                                 </DataTemplate>
                             </ItemsControl.ItemTemplate>
                         </ItemsControl>
-                        <TextBlock Text="Здесь появятся последние открытые PDF." Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,12">
+                        <TextBlock Text="Здесь появятся последние открытые PDF." Foreground="{DynamicResource Muted}" TextWrapping="Wrap" Margin="0,12">
                             <TextBlock.Style>
                                 <Style TargetType="TextBlock">
                                     <Setter Property="Visibility" Value="Collapsed"/>
@@ -573,14 +579,14 @@
         </ScrollViewer>
 
         <!-- Status bar -->
-        <Border Grid.Row="4" Background="White" BorderBrush="{StaticResource Line}" BorderThickness="0,1,0,0">
+        <Border Grid.Row="4" Background="{DynamicResource Surface}" BorderBrush="{DynamicResource Line}" BorderThickness="0,1,0,0">
             <DockPanel Margin="18,0">
-                <TextBlock DockPanel.Dock="Right" Text="{Binding DocumentSummary}" Foreground="{StaticResource Muted}" FontSize="11"
+                <TextBlock DockPanel.Dock="Right" Text="{Binding DocumentSummary}" Foreground="{DynamicResource Muted}" FontSize="11"
                            VerticalAlignment="Center" Margin="20,0,0,0"/>
-                <TextBlock Text="{Binding Status}" Foreground="{StaticResource Muted}" FontSize="11" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+                <TextBlock Text="{Binding Status}" Foreground="{DynamicResource Muted}" FontSize="11" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
             </DockPanel>
         </Border>
-        <ProgressBar Grid.Row="3" Height="3" VerticalAlignment="Top" IsIndeterminate="True" Foreground="{StaticResource Accent}"
+        <ProgressBar Grid.Row="3" Height="3" VerticalAlignment="Top" IsIndeterminate="True" Foreground="{DynamicResource Accent}"
                      Visibility="{Binding IsBusy, Converter={StaticResource Visible}}"/>
     </Grid>
 </Window>

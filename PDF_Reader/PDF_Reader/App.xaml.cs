@@ -45,9 +45,9 @@ public partial class App : Application
         e.Handled = true;
         try
         {
-            MessageBox.Show(_window!, "Произошла непредвиденная ошибка: " + e.Exception.Message +
+            Views.MessageWindow.Show(_window!, "Произошла непредвиденная ошибка: " + e.Exception.Message +
                 "\n\nИзменения документов сохранены в резервную копию. Подробности записаны в журнал:\n" + ErrorLog.Path,
-                "PaperDesk PDF", MessageBoxButton.OK, MessageBoxImage.Error);
+                "PaperDesk PDF", MessageBoxButton.OK);
         }
         catch (Exception)
         {

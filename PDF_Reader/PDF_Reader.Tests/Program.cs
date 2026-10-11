@@ -542,6 +542,25 @@ internal static class Program
         Pump(200);
         Console.WriteLine("WPF: layout ready");
         SaveWindow(window, Path.Combine(output, "welcome.png"));
+        window.Themes.SetTheme(AppTheme.Dark);
+        Pump(100);
+        SaveWindow(window, Path.Combine(output, "welcome-dark.png"));
+        Check(new SettingsService(Path.Combine(output, "settings.json")).Value.Theme == AppTheme.Dark, "theme selection is persisted");
+        var textDialog = new PDF_Reader.Views.TextInputWindow("Добавить текст", "Текст и размер шрифта", "Пример текста", multiline: true, fontSize: 12) { Owner = window, ShowActivated = false };
+        textDialog.Show();
+        Pump(100);
+        SaveWindow(textDialog, Path.Combine(output, "text-dialog-dark.png"));
+        Check(((SolidColorBrush)textDialog.Background).Color.R < 128, "text dialog follows dark theme");
+        window.Themes.SetTheme(AppTheme.Light);
+        Pump(100);
+        Check(((SolidColorBrush)textDialog.Background).Color.R > 200, "open dialog follows live theme switch");
+        textDialog.Close();
+        var messageDialog = new PDF_Reader.Views.MessageWindow("Несохранённые изменения", "Сохранить изменения в документе?", MessageBoxButton.YesNoCancel) { Owner = window, ShowActivated = false };
+        window.Themes.SetTheme(AppTheme.Dark);
+        messageDialog.Show();
+        Pump(100);
+        SaveWindow(messageDialog, Path.Combine(output, "message-dialog-dark.png"));
+        messageDialog.Close();
 
         UntilComplete(workspace.OpenPathAsync(Path.Combine(output, "sample.pdf")));
         Pump(900);
@@ -549,6 +568,15 @@ internal static class Program
         workspace.FitWidthCommand.Execute(null);
         Pump(900);
         SaveWindow(window, Path.Combine(output, "workspace.png"));
+        var darkPage = workspace.Document!.Render(0, 400);
+        window.Themes.SetTheme(AppTheme.Light);
+        Pump(100);
+        SaveWindow(window, Path.Combine(output, "workspace-light.png"));
+        Check(SameImage(darkPage, workspace.Document.Render(0, 400)), "PDF colours stay identical across themes");
+        Check(!workspace.Document.IsDirty, "theme switch does not modify PDF");
+        window.Themes.SetTheme(AppTheme.System);
+        Check(window.Themes.Theme == AppTheme.System, "system theme can be restored");
+        window.Themes.SetTheme(AppTheme.Dark);
 
         workspace.Query = "Hello";
         Pump(900);
@@ -727,9 +755,8 @@ internal static class Program
 
     private static void SaveWindow(Window window, string path)
     {
-        var content = (FrameworkElement)window.Content;
-        var bitmap = new RenderTargetBitmap((int)content.ActualWidth, (int)content.ActualHeight, 96, 96, PixelFormats.Pbgra32);
-        bitmap.Render(content);
+        var bitmap = new RenderTargetBitmap((int)window.ActualWidth, (int)window.ActualHeight, 96, 96, PixelFormats.Pbgra32);
+        bitmap.Render(window);
         SaveImage(bitmap, path);
     }
 

@@ -43,14 +43,14 @@ public sealed class DialogService(Func<Window> owner) : IUserDialogs
     }
 
     public MessageBoxResult AskSave(string name) =>
-        MessageBox.Show(owner(), $"Сохранить изменения в «{name}»?", "Несохранённые изменения", MessageBoxButton.YesNoCancel, MessageBoxImage.Question);
+        MessageWindow.Show(owner(), $"Сохранить изменения в «{name}»?", "Несохранённые изменения", MessageBoxButton.YesNoCancel);
 
     public bool Confirm(string title, string message) =>
-        MessageBox.Show(owner(), message, title, MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes;
+        MessageWindow.Show(owner(), message, title, MessageBoxButton.YesNo) == MessageBoxResult.Yes;
 
     public void Error(Exception exception) =>
-        MessageBox.Show(owner(), exception.Message, "Не удалось выполнить действие", MessageBoxButton.OK, MessageBoxImage.Warning);
+        MessageWindow.Show(owner(), exception.Message, "Не удалось выполнить действие", MessageBoxButton.OK);
 
     public void Info(string title, string message) =>
-        MessageBox.Show(owner(), message, title, MessageBoxButton.OK, MessageBoxImage.Information);
+        MessageWindow.Show(owner(), message, title, MessageBoxButton.OK);
 }

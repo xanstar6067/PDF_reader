@@ -13,6 +13,7 @@ public record RecentFile(string Path, int Page, DateTime OpenedAt)
 public sealed class AppSettings
 {
     public List<RecentFile> RecentFiles { get; set; } = [];
+    public AppTheme Theme { get; set; } = AppTheme.System;
     public double Zoom { get; set; } = 1;
     public PrintScaling PrintScaling { get; set; } = PrintScaling.Fit;
 }
@@ -35,6 +36,7 @@ public sealed class SettingsService
             Value = new();
         }
         Value.RecentFiles ??= [];
+        if (!Enum.IsDefined(Value.Theme)) Value.Theme = AppTheme.System;
         if (!double.IsFinite(Value.Zoom) || Value.Zoom < .25 || Value.Zoom > 4) Value.Zoom = 1;
         if (!Enum.IsDefined(Value.PrintScaling)) Value.PrintScaling = PrintScaling.Fit;
     }

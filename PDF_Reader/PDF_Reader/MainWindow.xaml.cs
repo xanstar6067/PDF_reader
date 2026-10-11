@@ -19,6 +19,7 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer _scrollTimer;
     private readonly DispatcherTimer _autosaveTimer;
     private readonly DialogService _dialogs;
+    public ThemeService Themes { get; }
 
     public WorkspaceViewModel Workspace { get; }
 
@@ -26,7 +27,10 @@ public partial class MainWindow : Window
 
     public MainWindow(SettingsService settings, RecoveryService? recovery = null)
     {
+        Themes = new ThemeService(settings);
         InitializeComponent();
+        SourceInitialized += (_, _) => ThemeService.UpdateTitleBar(this);
+        UpdateThemeMenu();
         _dialogs = new DialogService(() => this);
         Workspace = new WorkspaceViewModel(_dialogs, settings, recovery);
         DataContext = Workspace;
@@ -62,6 +66,7 @@ public partial class MainWindow : Window
         {
             _scrollTimer.Stop();
             _autosaveTimer.Stop();
+            Themes.Dispose();
             Workspace.Dispose();
         };
     }
@@ -354,6 +359,22 @@ public partial class MainWindow : Window
             WindowState = WindowState.Maximized;
         }
         _fullscreen = !_fullscreen;
+    }
+
+    private void Theme_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is MenuItem { Tag: string value } && Enum.TryParse<AppTheme>(value, out var theme))
+        {
+            Themes.SetTheme(theme);
+            UpdateThemeMenu();
+        }
+    }
+
+    private void UpdateThemeMenu()
+    {
+        SystemThemeMenu.IsChecked = Themes.Theme == AppTheme.System;
+        LightThemeMenu.IsChecked = Themes.Theme == AppTheme.Light;
+        DarkThemeMenu.IsChecked = Themes.Theme == AppTheme.Dark;
     }
 
     private void FullScreen_Click(object sender, RoutedEventArgs e) => ToggleFullscreen();
