@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net10.0-windows7.0": {
+      "bblanchon.PDFium.Win32": {
+        "type": "Direct",
+        "requested": "[157.0.8086, )",
+        "resolved": "157.0.8086",
+        "contentHash": "cu9ozLzwk0O329oXcF1XVg8tsc2q4BzavKBzOMnkRWWNlFWjiw8uBZWrt5W5NDlHOy1Yb+uIBPAn7YYJaf+7Yg=="
+      }
+    },
+    "net10.0-windows7.0/win-x64": {
+      "bblanchon.PDFium.Win32": {
+        "type": "Direct",
+        "requested": "[157.0.8086, )",
+        "resolved": "157.0.8086",
+        "contentHash": "cu9ozLzwk0O329oXcF1XVg8tsc2q4BzavKBzOMnkRWWNlFWjiw8uBZWrt5W5NDlHOy1Yb+uIBPAn7YYJaf+7Yg=="
+      }
+    }
+  }
+}
