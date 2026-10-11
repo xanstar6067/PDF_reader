@@ -513,6 +513,62 @@ internal static class Program
         Check(recovery.FindOrphaned().Count == 0 && !File.Exists(Path.Combine(directory, "crashed.pdf")), "recovery copy removed");
     }
 
+    private static void TestScrollBars()
+    {
+        foreach (var orientation in new[] { System.Windows.Controls.Orientation.Vertical, System.Windows.Controls.Orientation.Horizontal })
+        {
+            var vertical = orientation == System.Windows.Controls.Orientation.Vertical;
+            var bar = new System.Windows.Controls.Primitives.ScrollBar
+            {
+                Orientation = orientation, Minimum = 0, Maximum = 1_000_000, ViewportSize = 500,
+                Width = vertical ? 16 : 800, Height = vertical ? 800 : 16,
+                Style = (Style)Application.Current.FindResource(typeof(System.Windows.Controls.Primitives.ScrollBar))
+            };
+            var host = new Window
+            {
+                Content = bar, SizeToContent = SizeToContent.WidthAndHeight, WindowStyle = WindowStyle.None,
+                ShowActivated = false, ShowInTaskbar = false, Opacity = 0
+            };
+            host.Show();
+            bar.ApplyTemplate();
+            var track = (System.Windows.Controls.Primitives.Track)bar.Template.FindName("PART_Track", bar);
+            foreach (var length in new[] { 800d, 160d, 400d })
+            {
+                var size = vertical ? new Size(16, length) : new Size(length, 16);
+                bar.Width = size.Width;
+                bar.Height = size.Height;
+                foreach (var value in new[] { 0d, 500_000d, 1_000_000d })
+                {
+                    bar.Value = value;
+                    bar.Measure(size);
+                    bar.Arrange(new Rect(size));
+                    bar.UpdateLayout();
+                    var thumb = track.Thumb;
+                    var thumbLength = vertical ? thumb.ActualHeight : thumb.ActualWidth;
+                    Check(track.IsVisible && thumbLength >= 40 && thumbLength < length,
+                        $"{orientation} thumb remains usable in a long document at track length {length} (visible={track.IsVisible}, thumb={thumbLength}, maximum={track.Maximum}, viewport={track.ViewportSize})");
+                    var origin = thumb.TranslatePoint(new Point(), track);
+                    var offset = vertical ? origin.Y : origin.X;
+                    Check(Math.Abs(offset - (length - thumbLength) * value / bar.Maximum) < .01,
+                        $"{orientation} thumb reaches start, middle and end after resizing");
+                    var travel = length - thumbLength;
+                    Check(Math.Abs(track.ValueFromDistance(vertical ? 0 : travel, vertical ? travel : 0) - bar.Maximum) < .01,
+                        $"{orientation} dragging spans the full scroll range");
+                    Check(thumb.InputHitTest(new Point(1, 1)) is not null,
+                        $"{orientation} thumb margin can be grabbed");
+                }
+            }
+            bar.Maximum = 1500;
+            bar.Value = 0;
+            bar.Measure(new Size(bar.Width, bar.Height));
+            bar.Arrange(new Rect(0, 0, bar.Width, bar.Height));
+            bar.UpdateLayout();
+            Check(Math.Abs((vertical ? track.Thumb.ActualHeight : track.Thumb.ActualWidth) - 100) < .01,
+                $"{orientation} thumb still reflects viewport proportion for shorter documents");
+            host.Close();
+        }
+    }
+
     private static void TestUi(string output)
     {
         Console.WriteLine("WPF: initialize application resources");
@@ -520,6 +576,7 @@ internal static class Program
         // A plain Application keeps the product's OnStartup from opening a second window with test arguments.
         var application = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
         application.Resources.MergedDictionaries.Add(new ResourceDictionary { Source = new Uri("/PaperDesk;component/Views/Theme.xaml", UriKind.Relative) });
+        TestScrollBars();
         SynchronizationContext.SetSynchronizationContext(new DispatcherSynchronizationContext(Dispatcher.CurrentDispatcher));
         application.DispatcherUnhandledException += (_, e) =>
         {
