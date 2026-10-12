@@ -119,8 +119,8 @@ public partial class MainWindow : Window
         Workspace.IsPrinting = true;
         try
         {
-            await PrintService.PrintAsync(document, Workspace.CurrentPage, Workspace.PrintScaling, status => Workspace.Status = status);
-            Workspace.Status = "Задание отправлено на принтер";
+            var sent = await PrintService.PrintAsync(this, document, Workspace.CurrentPage, Workspace.PrintScaling, status => Workspace.Status = status);
+            Workspace.Status = sent ? "Задание отправлено на принтер" : "Печать отменена";
         }
         catch (OperationCanceledException)
         {

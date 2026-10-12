@@ -103,6 +103,19 @@ internal static class PdfFixture
         PlainStream("0 0 1 rg 0 0 100 100 re f")
     ]);
 
+    /// <summary>A coloured 500 x 700 mm canvas, tiled 3 x 3 on A4 with default glue margins.</summary>
+    public static byte[] CreatePoster() => Build([
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1417.3228 1984.252] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        PlainStream("0.9 0.95 1 rg 0 0 1418 1985 re f 0.1 0.35 0.65 RG 5 w 40 40 1337 1904 re S " +
+            "0.8 0.15 0.2 rg 50 1650 700 250 re f 0.1 0.6 0.3 rg 850 800 500 550 re f " +
+            "0.1 0.35 0.65 RG 12 w 50 50 m 1350 1900 l S 1350 50 m 50 1900 l S " +
+            "1 1 1 rg BT /F1 70 Tf 90 1770 Td (PaperDesk POSTER) Tj ET " +
+            "0.1 0.2 0.3 rg BT /F1 40 Tf 100 1550 Td (500 x 700 mm / A4 tiles) Tj ET"),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+    ]);
+
     private static byte[] Build(List<string> objects, string extraTrailer = "")
     {
         var pdf = new StringBuilder("%PDF-1.7\n");

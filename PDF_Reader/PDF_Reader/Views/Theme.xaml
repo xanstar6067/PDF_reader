@@ -3,6 +3,8 @@
                     xmlns:views="clr-namespace:PDF_Reader.Views"
                     xmlns:sys="clr-namespace:System;assembly=System.Runtime">
 
+    <ResourceDictionary.MergedDictionaries><ResourceDictionary Source="ControlTemplates.xaml"/></ResourceDictionary.MergedDictionaries>
+
     <SolidColorBrush x:Key="Accent" Color="#D73532"/>
     <SolidColorBrush x:Key="Ink" Color="#242834"/>
     <SolidColorBrush x:Key="Muted" Color="#747B88"/>
@@ -103,7 +105,7 @@
     </Style>
 
     <!-- A row of selectable swatches (colours, line widths). -->
-    <Style x:Key="ChoiceList" TargetType="ListBox">
+    <Style x:Key="ChoiceList" TargetType="ListBox" BasedOn="{StaticResource {x:Type ListBox}}">
         <Setter Property="BorderThickness" Value="0"/>
         <Setter Property="Background" Value="Transparent"/>
         <Setter Property="Margin" Value="4,0,0,0"/>
@@ -206,11 +208,6 @@
         </Setter>
     </Style>
 
-    <Style TargetType="ListBox">
-        <Setter Property="Background" Value="{DynamicResource Surface}"/>
-        <Setter Property="Foreground" Value="{DynamicResource Ink}"/>
-        <Setter Property="BorderBrush" Value="{DynamicResource Line}"/>
-    </Style>
     <Style TargetType="ListBoxItem">
         <Setter Property="Foreground" Value="{DynamicResource Ink}"/>
         <Setter Property="Padding" Value="3"/>
@@ -228,15 +225,6 @@
                 </ControlTemplate>
             </Setter.Value>
         </Setter>
-    </Style>
-    <Style TargetType="TreeView">
-        <Setter Property="Background" Value="{DynamicResource Surface}"/>
-        <Setter Property="Foreground" Value="{DynamicResource Ink}"/>
-        <Setter Property="BorderBrush" Value="{DynamicResource Line}"/>
-    </Style>
-    <Style TargetType="TabControl">
-        <Setter Property="Foreground" Value="{DynamicResource Ink}"/>
-        <Setter Property="Background" Value="{DynamicResource Surface}"/>
     </Style>
 
     <Style x:Key="ToolButton" TargetType="ToggleButton">
@@ -305,12 +293,6 @@
         </Setter>
     </Style>
 
-    <Style TargetType="ToolTip">
-        <Setter Property="MaxWidth" Value="350"/>
-        <Setter Property="Background" Value="{DynamicResource Surface}"/>
-        <Setter Property="Foreground" Value="{DynamicResource Ink}"/>
-        <Setter Property="BorderBrush" Value="{DynamicResource Line}"/>
-    </Style>
 
     <Style TargetType="Menu">
         <Setter Property="Foreground" Value="{DynamicResource Ink}"/>
@@ -334,7 +316,7 @@
                                 <TextBlock x:Name="Arrow" Grid.Column="3" Text="›" HorizontalAlignment="Right" Visibility="Collapsed"/>
                             </Grid>
                         </Border>
-                        <Popup x:Name="PART_Popup" IsOpen="{Binding IsSubmenuOpen, RelativeSource={RelativeSource TemplatedParent}}" Placement="Right" AllowsTransparency="True" Focusable="False" PopupAnimation="Fade">
+                        <Popup x:Name="PART_Popup" IsOpen="{Binding IsSubmenuOpen, RelativeSource={RelativeSource TemplatedParent}}" Placement="Right" AllowsTransparency="True" Focusable="False" PopupAnimation="None">
                             <Border Background="{DynamicResource Surface}" BorderBrush="{DynamicResource Line}" BorderThickness="1" CornerRadius="6" Padding="4" MinWidth="200">
                                 <ScrollViewer CanContentScroll="True" VerticalScrollBarVisibility="Auto" MaxHeight="600">
                                     <StackPanel IsItemsHost="True" KeyboardNavigation.DirectionalNavigation="Cycle"/>

@@ -300,7 +300,7 @@ public sealed class PdfDocument : IDisposable
     }
 
     /// <summary>Renders only <paramref name="region"/> of a page drawn at <paramref name="pageWidth"/>×<paramref name="pageHeight"/> pixels.</summary>
-    public BitmapSource RenderRegion(int index, int pageWidth, int pageHeight, Int32Rect region, CancellationToken cancellation = default)
+    public BitmapSource RenderRegion(int index, int pageWidth, int pageHeight, Int32Rect region, CancellationToken cancellation = default, bool printing = false)
     {
         if (pageWidth is < 1 or > MaxRenderSide || pageHeight is < 1 or > MaxRenderSide)
             throw new ArgumentOutOfRangeException(nameof(pageWidth), "Слишком большой масштаб страницы.");
@@ -314,7 +314,7 @@ public sealed class PdfDocument : IDisposable
         lock (Gate)
         {
             cancellation.ThrowIfCancellationRequested();
-            return OnPage(index, page => RenderBitmap(page, pageWidth, pageHeight, clipped, false, cancellation), forms: true);
+            return OnPage(index, page => RenderBitmap(page, pageWidth, pageHeight, clipped, printing, cancellation), forms: true);
         }
     }
 

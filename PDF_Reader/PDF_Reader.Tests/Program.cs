@@ -42,6 +42,8 @@ internal static class Program
             Console.WriteLine("PASS: signed documents saved incrementally, unchanged save is byte-identical");
             TestRendering(output);
             TestPrintLayout();
+            TestExtendedPrintLayout();
+            if (args.Contains("--printer-check")) TestPrinterProfiles();
             Console.WriteLine("PASS: region rendering, aspect ratio limits, print placement");
             TestAnnotations();
             TestAnnotationEditing(output);
@@ -387,6 +389,87 @@ internal static class Program
         Check(bounds.Height > bounds.Width && Rect.Inflate(portraitArea, 1, 1).Contains(bounds), "landscape page printed rotated inside the printable area");
     }
 
+    private static void TestExtendedPrintLayout()
+    {
+        var mm = PrintLayout.Mm;
+        var paper = new Size(210 * mm, 297 * mm);
+        var area = new Rect(5 * mm, 5 * mm, 200 * mm, 287 * mm);
+        var a1 = new[] { new PdfPageInfo(0, 594 * 72 / 25.4, 841 * 72 / 25.4, "1") };
+        var poster = new PrintOptions { Mode = PrintMode.Poster, GlueMarginsMm = new(0), OverlapMm = 0, Labels = false };
+        var plan = PrintLayout.Create(a1, [0], paper, area, poster);
+        Check(plan.Sheets.Count == 9 && plan.Sheets[0].Label.Contains("1-1") && plan.Sheets[^1].Label.Contains("3-3"), "A1 poster tiles 3 x 3 without margins or overlap");
+        Check(Math.Abs(plan.Sheets[0].Slots[0].Size.Width / mm - 594) < .001, "poster preserves physical size at 100 percent");
+        var glue = PrintLayout.Create(a1, [0], paper, area, poster with { GlueMarginsMm = new(8), OverlapMm = 5, Labels = true });
+        Check(glue.Sheets.Count == 16 && Math.Abs(glue.ContentArea.Left - area.Left - 8 * mm) < .001 && Math.Abs(glue.ContentArea.Width - area.Width + 16 * mm) < .001, "glue margins reserve white strips and change tile count");
+        var first = glue.Sheets[0].Slots[0];
+        var right = glue.Sheets[1].Slots[0];
+        Check(Math.Abs(first.Center.X - right.Center.X - (glue.ContentArea.Width - 5 * mm)) < .001, "adjacent tiles duplicate exactly the requested overlap");
+        var down = glue.Sheets[4].Slots[0];
+        Check(Math.Abs(first.Center.Y - down.Center.Y - (glue.ContentArea.Height - 5 * mm)) < .001, "vertical overlap uses the same physical units");
+        var asymmetric = PrintLayout.Create(a1, [0], paper, area, poster with { GlueMarginsMm = new(3, 7, 11, 15) });
+        Check(Math.Abs(asymmetric.ContentArea.Top - area.Top - 7 * mm) < .001 && Math.Abs(asymmetric.ContentArea.Width - area.Width + 14 * mm) < .001, "four glue margins are independent");
+        Throws<ArgumentException>(() => PrintLayout.Create(a1, [0], paper, area, poster with { OverlapMm = 100, GlueMarginsMm = new(70) }), "reject overlap wider than tile");
+        Throws<ArgumentException>(() => PrintLayout.Create(a1, [0], paper, area, poster with { ScalePercent = double.NaN }), "reject nonfinite print scale");
+        Throws<ArgumentException>(() => PrintLayout.Create([new(0, 1e7, 1e7, "1")], [0], paper, area, poster), "limit enormous print jobs before allocating tiles");
+        Check(PrintLayout.SelectPages("1, 3 - 5, 3", 6).SequenceEqual(new[] { 0, 2, 3, 4 }), "mixed ranges preserve order and remove duplicates");
+        Check(PrintLayout.SelectPages("1-6", 6, PrintPageFilter.Even, true).SequenceEqual(new[] { 5, 3, 1 }), "even pages in reverse order");
+        Throws<ArgumentException>(() => PrintLayout.SelectPages("0, 9", 6), "reject pages outside document");
+        Throws<ArgumentException>(() => PrintLayout.SelectPages("1,", 6), "reject incomplete ranges");
+        Throws<ArgumentException>(() => PrintLayout.SelectPages("1", 6, PrintPageFilter.Even), "reject an empty filtered selection");
+
+        var info = Enumerable.Range(0, 5).Select(i => new PdfPageInfo(i, 300, 400, (i + 1).ToString())).ToArray();
+        var custom = PrintLayout.Create(info, [0], paper, area, new PrintOptions { Scaling = PrintScaling.Custom, ScalePercent = 150, AutoRotate = false });
+        Check(Math.Abs(custom.Sheets[0].Slots[0].Size.Width - 600) < .001, "custom print scale changes physical dimensions");
+        var multi = PrintLayout.Create(info, [0, 1, 2, 3, 4], paper, area, new PrintOptions { Mode = PrintMode.Multiple });
+        Check(multi.Sheets.Count == 2 && multi.Sheets[0].Slots.Count == 4 && multi.Sheets[1].Slots.Count == 1, "n-up groups pages including incomplete final sheet");
+        Check(multi.Sheets[0].Slots[1].Center.X > multi.Sheets[0].Slots[0].Center.X && multi.Sheets[0].Slots[2].Center.Y > multi.Sheets[0].Slots[0].Center.Y, "horizontal page ordering");
+        var vertical = PrintLayout.Create(info, [0, 1, 2, 3], paper, area, new PrintOptions { Mode = PrintMode.Multiple, PageOrder = PrintPageOrder.Vertical });
+        Check(vertical.Sheets[0].Slots[1].Center.Y > vertical.Sheets[0].Slots[0].Center.Y && vertical.Sheets[0].Slots[2].Center.X > vertical.Sheets[0].Slots[0].Center.X, "vertical page ordering");
+        var booklet = PrintLayout.Create(info, [0, 1, 2, 3, 4], paper, area, new PrintOptions { Mode = PrintMode.Booklet });
+        Check(booklet.Sheets.Count == 4 && booklet.Sheets[0].Slots.Single().PageIndex == 0 && booklet.Sheets[0].Slots.Single().Center.X > area.X + area.Width / 2, "booklet pads to a multiple of four with blank first left slot");
+        Check(booklet.Sheets[2].Slots.Single().PageIndex == 2 && booklet.Sheets[3].Slots.Select(s => s.PageIndex).SequenceEqual(new[] { 3, 4 }), "booklet imposition pairs inner pages correctly");
+        var backs = PrintLayout.Create(info, [0, 1, 2, 3, 4], paper, area, new PrintOptions { Mode = PrintMode.Booklet, BookletSide = BookletSide.Back, RightBinding = true });
+        Check(backs.Sheets.Count == 2 && backs.Sheets[^1].Slots.Select(s => s.PageIndex).SequenceEqual(new[] { 4, 3 }), "manual booklet backs and right binding");
+
+        using var doc = PdfDocument.FromBytes(PdfFixture.CreatePoster());
+        var actual = PrintLayout.Create(doc.GetPages(), [0], paper, area, new PrintOptions { Mode = PrintMode.Poster });
+        Check(actual.Sheets.Count == 9 && actual.Sheets[^1] is { Row: 3, Column: 3 }, "real poster PDF has the expected 3 x 3 coordinates");
+        var paginator = PrintService.CreatePaginator(doc, actual);
+        var bitmap = new RenderTargetBitmap((int)Math.Ceiling(paper.Width), (int)Math.Ceiling(paper.Height), 96, 96, PixelFormats.Pbgra32);
+        bitmap.Render(paginator.GetPage(0).Visual);
+        var pixels = Pixels(bitmap);
+        var center = ((int)(actual.ContentArea.Top + 180) * bitmap.PixelWidth + (int)(actual.ContentArea.Left + 80)) * 4;
+        Check(pixels[center + 2] > pixels[center + 1] + 60, "poster first tile contains the correct red PDF region");
+        var margin = ((int)(actual.ContentArea.Top + 100) * bitmap.PixelWidth + (int)(actual.ImageableArea.Left + 4)) * 4;
+        Check(pixels[margin] > 245 && pixels[margin + 1] > 245 && pixels[margin + 2] > 245, "glue strip remains white on the printed sheet");
+        var lastBitmap = new RenderTargetBitmap(bitmap.PixelWidth, bitmap.PixelHeight, 96, 96, PixelFormats.Pbgra32);
+        lastBitmap.Render(paginator.GetPage(8).Visual);
+        Check(!SameImage(bitmap, lastBitmap), "last tile renders a different PDF region");
+        Check(!doc.IsDirty, "printing layout never edits the original PDF");
+    }
+
+    private static void TestPrinterProfiles()
+    {
+        var printers = PrinterSettingsService.List();
+        Console.WriteLine($"PRINTERS: {printers.Names.Length} queues, checking capabilities without submitting jobs");
+        foreach (var name in printers.Names)
+        {
+            var profile = PrinterSettingsService.Load(name);
+            Check(profile.Papers.Count > 0, "printer exposes at least one paper choice");
+            foreach (var orientation in new[] { System.Printing.PageOrientation.Portrait, System.Printing.PageOrientation.Landscape })
+            {
+                var ticket = profile.Ticket.Clone();
+                ticket.PageMediaSize = profile.Papers.FirstOrDefault(p => p.Media.PageMediaSizeName == System.Printing.PageMediaSizeName.ISOA4)?.Media ?? profile.Papers[0].Media;
+                ticket.PageOrientation = orientation;
+                ticket.PagesPerSheet = 1;
+                ticket.PageScalingFactor = 100;
+                var geometry = PrinterSettingsService.Resolve(name, ticket);
+                Check(geometry.Area.Width > 0 && geometry.Area.Height > 0 && new Rect(geometry.Paper).Contains(geometry.Area), "validated driver geometry is inside physical paper");
+                Console.WriteLine($"PRINTER: {name}, {orientation}, {geometry.Paper.Width / PrintLayout.Mm:0.#} x {geometry.Paper.Height / PrintLayout.Mm:0.#} mm");
+            }
+        }
+    }
+
     private static void TestAnnotations()
     {
         using var doc = PdfDocument.FromBytes(PdfFixture.CreateMarkup());
@@ -598,6 +681,7 @@ internal static class Program
         Console.WriteLine("WPF: window shown, pumping layout");
         Pump(200);
         Console.WriteLine("WPF: layout ready");
+        TestThemePanels(window, output);
         SaveWindow(window, Path.Combine(output, "welcome.png"));
         window.Themes.SetTheme(AppTheme.Dark);
         Pump(100);
@@ -612,6 +696,7 @@ internal static class Program
         Pump(100);
         Check(((SolidColorBrush)textDialog.Background).Color.R > 200, "open dialog follows live theme switch");
         textDialog.Close();
+        TestPrintWindow(window, output);
         var messageDialog = new PDF_Reader.Views.MessageWindow("Несохранённые изменения", "Сохранить изменения в документе?", MessageBoxButton.YesNoCancel) { Owner = window, ShowActivated = false };
         window.Themes.SetTheme(AppTheme.Dark);
         messageDialog.Show();
@@ -718,6 +803,135 @@ internal static class Program
         Pump(100);
 
         TestRestoreAfterCrash(output);
+    }
+
+    private static void TestThemePanels(MainWindow owner, string output)
+    {
+        owner.Themes.SetTheme(AppTheme.Dark);
+        var surface = Application.Current.FindResource("Surface");
+        var root = new System.Windows.Controls.StackPanel { Margin = new Thickness(16) };
+        var menu = new System.Windows.Controls.Menu();
+        var file = new System.Windows.Controls.MenuItem { Header = "Файл" };
+        file.Items.Add(new System.Windows.Controls.MenuItem { Header = "Открыть", InputGestureText = "Ctrl+O" });
+        file.Items.Add(new System.Windows.Controls.MenuItem { Header = "Сохранить", IsEnabled = false });
+        menu.Items.Add(file);
+        root.Children.Add(menu);
+        var combo = new System.Windows.Controls.ComboBox { Margin = new Thickness(0, 10, 0, 10), SelectedIndex = 0 };
+        combo.Items.Add("Первая настройка"); combo.Items.Add("Вторая настройка");
+        root.Children.Add(combo);
+        var tree = new System.Windows.Controls.TreeView { Height = 160 };
+        var chapter = new System.Windows.Controls.TreeViewItem { Header = "Глава документа", IsExpanded = true, IsSelected = true };
+        chapter.Items.Add(new System.Windows.Controls.TreeViewItem { Header = "Вложенная закладка" });
+        tree.Items.Add(chapter);
+        var tabs = new System.Windows.Controls.TabControl { Height = 210 };
+        tabs.Items.Add(new System.Windows.Controls.TabItem { Header = "Закладки", Content = tree });
+        var list = new System.Windows.Controls.ListBox { SelectedIndex = 0 };
+        for (var i = 0; i < 40; i++) list.Items.Add("Элемент списка " + i);
+        tabs.Items.Add(new System.Windows.Controls.TabItem { Header = "Список", Content = list });
+        root.Children.Add(tabs);
+        var progress = new System.Windows.Controls.ProgressBar { Height = 6, IsIndeterminate = true, Margin = new Thickness(0, 16, 0, 10) };
+        root.Children.Add(progress);
+        root.Children.Add(new System.Windows.Controls.CheckBox { Content = "Активная настройка", IsChecked = true });
+        var host = new Window { Width = 640, Height = 440, Content = root, ShowActivated = false, ShowInTaskbar = false, Owner = owner };
+        host.Show();
+        Pump(100);
+        void DarkFrame(FrameworkElement element, string label)
+        {
+            var bitmap = new RenderTargetBitmap(Math.Max(1, (int)Math.Ceiling(element.ActualWidth)), Math.Max(1, (int)Math.Ceiling(element.ActualHeight)), 96, 96, PixelFormats.Pbgra32);
+            bitmap.Render(element);
+            var pixels = Pixels(bitmap);
+            var bright = 0;
+            for (var i = 0; i < pixels.Length; i += 4) if (pixels[i] > 190 && pixels[i + 1] > 190 && pixels[i + 2] > 190) bright++;
+            Check(bright / (double)(bitmap.PixelWidth * bitmap.PixelHeight) < .15, label);
+        }
+        DarkFrame(host, "dark control surfaces have no light native panel backgrounds");
+        SaveWindow(host, Path.Combine(output, "theme-controls-dark.png"));
+        tabs.SelectedIndex = 1;
+        Pump(50);
+        list.ScrollIntoView(list.Items[^1]);
+        Pump(50);
+        DarkFrame(host, "dark tab switch and scrolling keep panel backgrounds dark");
+        combo.IsDropDownOpen = true;
+        Pump(25);
+        var popup = (System.Windows.Controls.Primitives.Popup)combo.Template.FindName("PART_Popup", combo);
+        Check(popup.IsOpen && popup.PopupAnimation == System.Windows.Controls.Primitives.PopupAnimation.None, "dropdown avoids native light fade animation");
+        foreach (var delay in new[] { 16, 50, 200 }) { Pump(delay); DarkFrame((FrameworkElement)popup.Child, "dropdown background remains dark across rendered frames"); }
+        owner.Themes.SetTheme(AppTheme.Light);
+        Pump(50);
+        Check(((SolidColorBrush)((System.Windows.Controls.Border)popup.Child).Background).Color.R > 200, "open dropdown follows light theme");
+        owner.Themes.SetTheme(AppTheme.Dark);
+        Pump(50);
+        Check(ReferenceEquals(surface, Application.Current.FindResource("Surface")), "theme changes preserve brush identity for open visuals");
+        DarkFrame((FrameworkElement)popup.Child, "open dropdown follows dark theme without recreating controls");
+        combo.IsDropDownOpen = false;
+        var tooltip = new System.Windows.Controls.ToolTip { Content = "Подсказка в выбранной теме", PlacementTarget = combo, IsOpen = true };
+        Pump(100);
+        DarkFrame(tooltip, "tooltip background uses dark theme");
+        tooltip.IsOpen = false;
+        var context = new System.Windows.Controls.ContextMenu { PlacementTarget = combo };
+        context.Items.Add(new System.Windows.Controls.MenuItem { Header = "Копировать" });
+        context.IsOpen = true;
+        Pump(100);
+        DarkFrame(context, "context menu background uses dark theme");
+        context.IsOpen = false;
+        file.IsSubmenuOpen = true;
+        Pump(100);
+        var menuPopup = (System.Windows.Controls.Primitives.Popup)file.Template.FindName("PART_Popup", file);
+        DarkFrame((FrameworkElement)menuPopup.Child, "main menu popup uses dark theme");
+        Check(menuPopup.PopupAnimation == System.Windows.Controls.Primitives.PopupAnimation.None, "main menu popup does not fade from light native chrome");
+        file.IsSubmenuOpen = false;
+        host.Close();
+        owner.Themes.SetTheme(AppTheme.Light);
+    }
+
+    private static void TestPrintWindow(MainWindow owner, string output)
+    {
+        using var doc = PdfDocument.FromBytes(PdfFixture.CreatePoster());
+        File.WriteAllBytes(Path.Combine(output, "poster.pdf"), PdfFixture.CreatePoster());
+        var dialog = new PDF_Reader.Views.PrintWindow(doc, doc.GetPages(), 1, PrintScaling.Fit, "Постер 500 × 700 мм.pdf", discoverPrinters: false)
+        { Owner = owner, ShowActivated = false, ShowInTaskbar = false };
+        dialog.Show();
+        void WaitPreview()
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(15);
+            while (!dialog.PreviewReady && DateTime.UtcNow < deadline) Pump(50);
+            Check(dialog.PreviewReady, "own print preview renders without printer driver preview");
+        }
+        WaitPreview();
+        SaveWindow(dialog, Path.Combine(output, "print-size-light.png"));
+        ((System.Windows.Controls.TabControl)dialog.FindName("ModeTabs")).SelectedIndex = 1;
+        WaitPreview();
+        Check(dialog.Plan!.Sheets.Count == 9, "poster settings drive live preview geometry");
+        SaveWindow(dialog, Path.Combine(output, "print-poster-light.png"));
+        var image = (System.Windows.Controls.Image)dialog.FindName("PreviewImage");
+        SaveImage((BitmapSource)image.Source, Path.Combine(output, "poster-tile-1-1.png"));
+        ((System.Windows.Controls.Button)dialog.FindName("NextButton")).RaiseEvent(new RoutedEventArgs(System.Windows.Controls.Button.ClickEvent));
+        WaitPreview();
+        Check(((System.Windows.Controls.TextBlock)dialog.FindName("SheetLabel")).Text.Contains("1-2"), "preview sheet navigation updates coordinates");
+        ((System.Windows.Controls.TextBox)dialog.FindName("GlueLeftBox")).Text = "12";
+        WaitPreview();
+        Check(Math.Abs(dialog.Plan!.ContentArea.Left / PrintLayout.Mm - 17) < .01, "glue margin edits update preview");
+        owner.Themes.SetTheme(AppTheme.Dark);
+        Pump(100);
+        SaveWindow(dialog, Path.Combine(output, "print-poster-dark.png"));
+        ((System.Windows.Controls.TextBox)dialog.FindName("OverlapBox")).Text = "bad";
+        Pump(450);
+        Check(dialog.Plan is null && image.Source is null && !((System.Windows.Controls.Button)dialog.FindName("PrintButton")).IsEnabled, "invalid settings clear stale preview and block printing");
+        ((System.Windows.Controls.TextBox)dialog.FindName("OverlapBox")).Text = "5";
+        ((System.Windows.Controls.TabControl)dialog.FindName("ModeTabs")).SelectedIndex = 2;
+        WaitPreview();
+        SaveWindow(dialog, Path.Combine(output, "print-multiple-dark.png"));
+        ((System.Windows.Controls.TabControl)dialog.FindName("ModeTabs")).SelectedIndex = 3;
+        WaitPreview();
+        Check(dialog.Plan!.Sheets.Count == 2, "booklet preview includes blank padded back");
+        SaveWindow(dialog, Path.Combine(output, "print-booklet-dark.png"));
+        ((System.Windows.Controls.TextBox)dialog.FindName("ScaleBox")).Text = "150";
+        ((System.Windows.Controls.ComboBox)dialog.FindName("ScalingBox")).SelectedIndex = 3;
+        ((System.Windows.Controls.TabControl)dialog.FindName("ModeTabs")).SelectedIndex = 0;
+        dialog.Close();
+        UntilComplete(dialog.DrainAsync());
+        Check(!doc.IsDirty, "closing print preview drains rendering without changing document");
+        owner.Themes.SetTheme(AppTheme.Light);
     }
 
     private static void TestRestoreAfterCrash(string output)

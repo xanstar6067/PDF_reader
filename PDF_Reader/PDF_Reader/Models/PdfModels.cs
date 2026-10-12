@@ -11,7 +11,7 @@ public static class AnnotationType
     public const int Note = 1, Square = 5, Circle = 6, Highlight = 9, Underline = 10, Squiggly = 11, StrikeOut = 12, Ink = 15;
 }
 
-public enum PrintScaling { Fit, ActualSize, ShrinkOversized }
+public enum PrintScaling { Fit, ActualSize, ShrinkOversized, Custom }
 
 public record PdfPageInfo(int Index, double Width, double Height, string Label)
 {

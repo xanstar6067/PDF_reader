@@ -2,6 +2,7 @@ using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Interop;
 using System.Windows.Media;
+using System.Windows.Data;
 using Microsoft.Win32;
 
 namespace PDF_Reader.Services;
@@ -11,7 +12,13 @@ public enum AppTheme { System, Light, Dark }
 /// <summary>Changes UI resources only; PDF rendering and annotation colours are independent.</summary>
 public sealed class ThemeService : IDisposable
 {
+    private sealed class ThemeColorSource : DependencyObject
+    {
+        public static readonly DependencyProperty ColorProperty = DependencyProperty.Register(nameof(Color), typeof(Color), typeof(ThemeColorSource));
+        public Color Color { get => (Color)GetValue(ColorProperty); set => SetValue(ColorProperty, value); }
+    }
     private readonly SettingsService _settings;
+    private readonly Dictionary<string, ThemeColorSource> _paletteSources = [];
     public AppTheme Theme => _settings.Value.Theme;
     public bool IsDark { get; private set; }
 
@@ -44,7 +51,22 @@ public sealed class ThemeService : IDisposable
         string[] dark = ["#FF8580", "#F3F3F3", "#B5B5B5", "#454545", "#202020", "#272727", "#2D2D2D", "#181818", "#383838", "#414141", "#49302F", "#3A3425", "#293747", "#FF9690"];
         var palette = IsDark ? dark : light;
         for (var i = 0; i < keys.Length; i++)
-            resources[keys[i]] = new SolidColorBrush((Color)ColorConverter.ConvertFromString(palette[i]));
+        {
+            var color = (Color)ColorConverter.ConvertFromString(palette[i]);
+            // Keep brush identities: open popups and existing visuals update together, without rebuilding resources.
+            if (_paletteSources.TryGetValue(keys[i], out var source))
+                source.Color = color;
+            else
+            {
+                // A bound brush cannot be auto-frozen by WPF when it is first used in a template.
+                var brush = new SolidColorBrush();
+                source = new ThemeColorSource { Color = color };
+                _paletteSources[keys[i]] = source;
+                BindingOperations.SetBinding(brush, SolidColorBrush.ColorProperty,
+                    new Binding(nameof(ThemeColorSource.Color)) { Source = source, Mode = BindingMode.OneWay });
+                resources[keys[i]] = brush;
+            }
+        }
 
         // Default WPF templates (trees, tab content, popups) also use these system keys.
         resources[SystemColors.WindowBrushKey] = resources["Surface"];
@@ -59,6 +81,14 @@ public sealed class ThemeService : IDisposable
         resources[SystemColors.HighlightTextBrushKey] = resources["Ink"];
         resources[SystemColors.InactiveSelectionHighlightBrushKey] = resources["Hover"];
         resources[SystemColors.InactiveSelectionHighlightTextBrushKey] = resources["Ink"];
+        resources[SystemColors.MenuBrushKey] = resources["Surface"];
+        resources[SystemColors.MenuBarBrushKey] = resources["Surface"];
+        resources[SystemColors.MenuTextBrushKey] = resources["Ink"];
+        resources[SystemColors.MenuHighlightBrushKey] = resources["Hover"];
+        resources[SystemColors.InfoBrushKey] = resources["Surface"];
+        resources[SystemColors.InfoTextBrushKey] = resources["Ink"];
+        resources[SystemColors.ScrollBarBrushKey] = resources["Subtle"];
+        resources[SystemColors.ControlDarkDarkBrushKey] = resources["Line"];
         foreach (Window window in Application.Current.Windows) UpdateTitleBar(window);
     }
 
@@ -79,7 +109,10 @@ public sealed class ThemeService : IDisposable
     {
         var handle = new WindowInteropHelper(window).Handle;
         if (handle == IntPtr.Zero) return;
-        var dark = Application.Current.TryFindResource("WindowBackground") is SolidColorBrush brush && brush.Color.R < 128 ? 1 : 0;
+        var background = (Application.Current.TryFindResource("WindowBackground") as SolidColorBrush)?.Color ?? Colors.White;
+        // The compositor also needs a dark clear colour for newly exposed regions during resizing/redraws.
+        if (HwndSource.FromHwnd(handle)?.CompositionTarget is { } target) target.BackgroundColor = background;
+        var dark = background.R < 128 ? 1 : 0;
         _ = DwmSetWindowAttribute(handle, 20, ref dark, sizeof(int));
         var caption = dark == 1 ? 0x00202020 : 0x00F9F7F6;
         var text = dark == 1 ? 0x00F3F3F3 : 0x00342824;
