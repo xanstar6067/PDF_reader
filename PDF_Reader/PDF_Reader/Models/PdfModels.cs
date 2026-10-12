@@ -13,7 +13,7 @@ public static class AnnotationType
 
 public enum PrintScaling { Fit, ActualSize, ShrinkOversized, Custom }
 
-public record PdfPageInfo(int Index, double Width, double Height, string Label)
+public record PdfPageInfo(int Index, double Width, double Height, string Label, bool Has3D = false)
 {
     public int Number => Index + 1;
 }

@@ -6,6 +6,25 @@ namespace PDF_Reader.Tests;
 
 internal static class PdfFixture
 {
+    public static byte[] Create3D(bool flate = false)
+    {
+        byte[] Payload(Action<BinaryWriter> write) { using var m=new MemoryStream();using(var w=new BinaryWriter(m,Encoding.UTF8,true))write(w);return m.ToArray(); }
+        void String(BinaryWriter w,string s){var bytes=Encoding.UTF8.GetBytes(s);w.Write((ushort)bytes.Length);w.Write(bytes);}
+        byte[] Block(uint type,byte[] data) => Payload(w=>{w.Write(type);w.Write((uint)data.Length);w.Write(0u);w.Write(data);while(w.BaseStream.Position%4!=0)w.Write((byte)0);});
+        byte[] Chain(string name,uint type,byte[] block) => Block(0xffffff14,Payload(w=>{String(w,name);w.Write(type);w.Write(0u);while(w.BaseStream.Position%4!=0)w.Write((byte)0);w.Write(1u);w.Write(block);}));
+        var header=Block(0x00443355,Payload(w=>{w.Write(0x100u);w.Write(4u);w.Write(0u);w.Write(0ul);w.Write(106u);}));
+        var node=Block(0xffffff22,Payload(w=>{String(w,"Triangle");w.Write(1u);String(w,"");for(int i=0;i<16;i++)w.Write(i%5==0?1f:0f);String(w,"mesh");w.Write(3u);}));
+        var declaration=Block(0xffffff31,Payload(w=>{String(w,"mesh");w.Write(0u);w.Write(1u);foreach(var n in new uint[]{1,3,0,0,0,0})w.Write(n);w.Write(1u);w.Write(0u);w.Write(0u);w.Write(0u);}));
+        var continuation=Block(0xffffff3b,Payload(w=>{String(w,"mesh");w.Write(0u);foreach(var n in new uint[]{1,3,0,0,0,0})w.Write(n);foreach(var f in new[]{-.4f,-.4f,0f,.4f,-.4f,0f,0f,.4f,0f})w.Write(f);w.Write(0u);w.Write(0u);w.Write(1u);w.Write(2u);}));
+        var stream=header.Concat(Chain("Triangle",0,node)).Concat(Chain("mesh",1,declaration)).Concat(continuation).ToArray();
+        if(flate){using var compressed=new MemoryStream();using(var z=new System.IO.Compression.ZLibStream(compressed,System.IO.Compression.CompressionLevel.Fastest,true))z.Write(stream);stream=compressed.ToArray();}
+        return Build([
+            "<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << >> /Annots [4 0 R] >>",
+            "<< /Type /Annot /Subtype /3D /Rect [30 30 550 800] /3DD 5 0 R >>",
+            $"<< /Type /3D /Subtype /U3D /Length {stream.Length}"+(flate?" /Filter /FlateDecode":"")+" >>\nstream\n"+Encoding.Latin1.GetString(stream)+"\nendstream"
+        ]);
+    }
     public static byte[] Create(bool encrypted = false, int permissions = -4)
     {
         byte[] id = Enumerable.Range(1, 16).Select(i => (byte)i).ToArray();

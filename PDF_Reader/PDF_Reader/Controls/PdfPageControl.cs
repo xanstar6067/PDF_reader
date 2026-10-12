@@ -160,7 +160,7 @@ public sealed class PdfPageControl : FrameworkElement
     }
 
     private bool UsesDetail(int width, int height) =>
-        !Thumbnail && (double)width * height > FullRenderPixels && width <= PdfDocument.MaxRenderSide && height <= PdfDocument.MaxRenderSide;
+        !Thumbnail && Item?.Info.Has3D != true && (double)width * height > FullRenderPixels && width <= PdfDocument.MaxRenderSide && height <= PdfDocument.MaxRenderSide;
 
     private async void RenderPage(int delay = 90)
     {
@@ -184,7 +184,9 @@ public sealed class PdfPageControl : FrameworkElement
         try
         {
             await Task.Delay(delay, token);
-            var image = await Task.Run(() => item.Document.Render(item.Info.Index, width, cancellation: token), token);
+            var image = item.Info.Has3D
+                ? await ThreeDService.PreviewAsync(item.Document, item.Info.Index, width, token)
+                : await Task.Run(() => item.Document.Render(item.Info.Index, width, cancellation: token), token);
             if (token.IsCancellationRequested || !IsLoaded || Item != item) return;
             _image = image;
             _imageKey = (width, version);

@@ -1,0 +1,1562 @@
+/* Copyright (C) 2023-2026 CascadiaVoxel LLC
+
+    nanoPRC is free software: you can redistribute it and/or modify it under
+    the terms of the GNU Affero General Public License as published by the
+    Free Software Foundation, either version 3 of the License, or (at your
+    option) any later version.
+
+    nanoPRC is distributed in the hope that it will be useful, but WITHOUT
+    ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+    FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public
+    License for more details.
+
+    You should have received a copy of the GNU Affero General Public License
+    along with nanoPRC. If not, see <https://www.gnu.org/licenses/>.
+*/
+
+#ifndef PRC_API_H
+#define PRC_API_H
+
+#include "../include/prc_context.h"
+#include "../src/prc_fwd.h" /* PRC_DEPRECATED; explicit relative path since "src" is
+                                not a registered CMake include directory (see prc_data.h
+                                and other src/ headers, which reach this file via the
+                                registered "include" directory instead) */
+
+/**
+ * @file prc_api.h
+ * @brief Public C API for loading PRC/PDF content and extracting tessellation data.
+ */
+
+/** @defgroup public_api Public API
+ *  @brief Public entry points for context management, loading, model tree creation,
+ *  and tessellation/primitive extraction.
+ *  @{
+ */
+
+#define PRC_API_ERROR_MEMORY -1
+#define PRC_API_ERROR_PARAMETER -2
+#define PRC_API_ERROR_PARSER -3
+#define PRC_API_ERROR_UNSUPPORTED -4
+
+ /* To avoid breaking things while I am working on this. This will
+    allow me to keep my branch frequently merged though */
+#define ENABLE_EXACT_GEOM_TESS 0
+
+/* Returned by prc_api_release_context when PRC_DEBUG_MEMORY is enabled
+    and at least one allocation remains unfreed. */
+#define PRC_API_MEMORY_LEAK_DETECTED 100
+
+#define prc_api_data void *
+
+#ifdef _WIN32
+#define PRC_EXPORT __declspec(dllexport)
+#elif !_WIN32 && PRC_BUILD_SHARED
+#define PRC_EXPORT __attribute__((visibility("default")))
+#else
+#define PRC_EXPORT
+#endif
+
+typedef enum
+{
+    PRC_API_TESS_UNKNOWN = 0,
+    PRC_API_TESS_3D,
+    PRC_API_TESS_3D_Compressed,
+    PRC_API_TESS_3D_Wire,
+    PRC_API_TESS_3D_Wire_Extra,
+    PRC_API_TESS_MarkUp,
+    PRC_API_EXACT_GEOM
+} prc_api_tess_type_t;
+
+/* prc_api_test_type_t was a typo for prc_api_tess_type_t. Kept as an alias so
+   any existing caller code still compiles, with a warning steering it to the
+   corrected name. Both PRC_DEPRECATED_PREFIX and PRC_DEPRECATED are used
+   because GCC/Clang and MSVC require the annotation in different positions
+   on a typedef; see prc_fwd.h. */
+typedef PRC_DEPRECATED_PREFIX("use prc_api_tess_type_t") prc_api_tess_type_t prc_api_test_type_t
+    PRC_DEPRECATED("use prc_api_tess_type_t");
+
+typedef enum
+{
+    PRC_API_INTEGER_ATTRIBUTE = 1,
+    PRC_API_DOUBLE_ATTRIBUTE,
+    PRC_API_VALUE_SECS_INTEGER_ATTRIBUTE,
+    PRC_API_STRING_ATTRIBUTE,
+    PRC_API_VALUE_TIME_ATTRIBUTE
+} prc_api_attribute_type_t;
+
+typedef enum
+{
+    PRC_API_NODE_UNKNOWN = 0,
+    PRC_API_NODE_PRODUCT,
+    PRC_API_NODE_PART,
+    PRC_API_NODE_PRODUCT_WITH_PART,
+    PRC_API_NODE_MARKUP
+} prc_api_node_type_t;
+
+typedef enum
+{
+    PRC_API_TRIANGLES = 0,
+    PRC_API_FAN,
+    PRC_API_STRIP,
+    PRC_API_LINE,
+    PRC_API_LINE_STRIP,
+    PRC_API_LINE_LOOP
+} prc_api_graphic_type_t;
+
+typedef enum
+{
+    PRC_API_TEXT_NO_MODE = -1,
+    PRC_API_TEXT_FACE_VIEW_MODE = 0,
+    PRC_API_TEXT_FRAME_DRAW_MODE = 1,
+    PRC_API_TEXT_FIXED_SIZE_MODE = 2
+} prc_api_text_block_mode_t;
+
+typedef struct prc_api_material_s
+{
+    float emissive[3];
+    float diffuse[3];
+    float specular[3];
+    float ambient[3];
+    float shininess;
+    float emissive_alpha;
+    float diffuse_alpha;
+    float specular_alpha;
+    float ambient_alpha;
+} prc_api_material;
+
+typedef struct prc_api_vertex_s
+{
+    float position[3];
+    float normal[3];
+    float color[4];
+    float uv[2];
+    uint8_t normal_set; /* 0 = not set, 1 = set */
+    uint8_t uv_set;     /* 0 = not set, 1 = set */
+
+    /* These are values that will only be used in the compressed tessellation
+       case as triangles can have individual styles. */
+    uint8_t tri_has_material;
+    int32_t style_index; /* Biased index for when we are finding and splitting vertices */
+    int32_t style_file_index; /* File index for when we are finding and splitting vertices */
+    float diffuse[3]; /* This will be used for the diffuse color if there is a style */
+    float tint[3];    /* This will be used for the tint color if there is a style */
+    float specular[3]; /* This will be used for the specular color if there is a style */
+    float emissive[3]; /* This will be used for the emissive color if there is a style */
+    float shininess; /* This will be used for the shininess if there is a style */
+    float alpha;
+} prc_api_vertex;
+
+typedef struct prc_api_texture_s
+{
+    uint32_t height;
+    uint32_t width;
+    uint32_t num_channels;
+    uint8_t has_transform;
+    double transform[9];
+    unsigned char *data;
+} prc_api_texture;
+
+typedef struct prc_api_tess_vertex_buffer_s
+{
+    size_t num_vertices;
+    size_t capacity;
+    prc_api_vertex *vertices;
+} prc_api_tess_vertex_buffer;
+
+/* The default style.  reserved has the details for the actual face */
+typedef struct prc_api_face_s
+{
+    uint8_t is_exact_geom_wire;
+    size_t num_graphic_primitives;
+    uint8_t is_material;
+    uint8_t has_transparency;
+    uint8_t is_texture;
+    prc_api_texture texture;
+    prc_api_material material;
+    uint8_t vertices_have_style;
+    uint8_t face_has_single_style;
+    uint32_t single_style_index; /* Only valid if face_has_single_style */
+    prc_api_tess_vertex_buffer face_vertices; /* Only valid in the PRC_API_TESS_3D case */
+    void *reserved;
+    uint8_t disable_face;
+} prc_api_face;
+
+typedef struct prc_api_shell_s
+{
+    size_t num_faces;
+    prc_api_face *shell_faces;
+} prc_api_shell;
+
+typedef struct prc_api_transform_s
+{
+    double matrix[16];
+    uint8_t is_identity;
+} prc_api_transform;
+
+typedef struct prc_api_text_primitive_s
+{
+    char *text;
+    double text_height;
+    double text_width;
+    double origin[3];
+    unsigned char *font;
+    double color[4];
+    prc_api_text_block_mode_t mode;
+} prc_api_text_primitive;
+
+/* A tessellation can have a material associated with it. But if the tessellation
+   has faces, the material associated with the face, will contain the material
+   that should be used with that face. Wires (e.g. lines) do not have faces but
+   their color can be defined by a material. Also, it turns out that we can
+   have different realizations of the same tessellation with different styles */
+typedef struct prc_api_tess_s
+{
+    prc_api_tess_type_t type;
+    uint8_t has_transparency;
+    size_t num_faces;
+    size_t num_shells;
+    size_t num_line_primitives;
+    size_t num_text_primitives;
+    prc_api_shell *shells;
+    prc_api_text_primitive *text_primitives;
+    prc_api_face *tess_faces;
+    prc_api_tess_vertex_buffer tess_vertices;
+    uint8_t bound_box_initialized;
+    double bounding_box_min[3];
+    double bounding_box_max[3];
+    const char *name;
+    int tess_index;
+    int part_index;
+    int product_index;
+    int mark_up_index;
+    uint8_t is_material;
+    prc_api_material tess_material;
+    void *reserved;
+    void *style_leaf;
+} prc_api_tess;
+
+typedef struct prc_api_inherited_style_s
+{
+    uint8_t has_inheritance;
+    uint32_t inherited_file_index;
+    uint32_t inherited_value;
+} prc_api_inherited_style;
+
+typedef struct prc_api_entity_ref_s
+{
+    uint32_t biased_layer_index;
+    uint32_t biased_index_of_line_style;
+    uint8_t behavior_bit_field1;
+    uint8_t behavior_bit_field2;
+    uint32_t file_index;
+} prc_api_entity_ref;
+
+typedef struct prc_api_attribute_entry_s prc_api_attribute_entry;
+struct prc_api_attribute_entry_s
+{
+    char *entry_title; /* Have not seen this set to anything other than NULL. This would be if the base_attribute had multiple entries */
+    prc_api_attribute_type_t type;
+
+    union
+    {
+        int value_integer;
+        double value_double;
+        uint32_t value_secs_integer;
+        char *value_string;
+        uint64_t value_time;
+    };
+};
+
+typedef struct prc_api_attribute_base_s prc_api_attribute_base;
+struct prc_api_attribute_base_s
+{
+    char *attribute_base_title;
+    size_t num_attributes; /* This is almost always 1. */
+    prc_api_attribute_entry *attributes;
+};
+
+typedef struct prc_api_attributes_s prc_api_attributes;
+struct prc_api_attributes_s
+{
+    uint32_t num_base_attributes;
+    prc_api_attribute_base *base_attributes;
+};
+
+/* A rep item can have a rep item. For example, an RI SET type has rep items.
+   We will just treat all of these as a type of part as it simplifies the code
+   */
+typedef struct prc_api_part_s prc_api_part;
+typedef struct prc_api_object_style_s prc_api_object_style;
+struct prc_api_part_s
+{
+    char *name;
+    uint8_t name_same_as_product;
+    prc_api_tess *tess;
+    prc_api_tess *tess_line;
+    uint32_t biased_tess_index;
+    uint32_t biased_topo_contex_index;
+    uint32_t biased_body_index;
+    uint32_t tess_file_index;
+    uint32_t biased_style_index;
+    uint32_t biased_layer_index;
+    uint8_t behavior_bit_field1;
+    uint8_t behavior_bit_field2;
+    uint32_t biased_local_coordinate_index;
+    size_t num_rep_items;
+    prc_api_part *rep_items;
+    uint8_t has_inherited_style;
+    prc_api_inherited_style color;
+    prc_api_inherited_style transparency;
+    uint32_t part_detail_index; /* Index into tess_style_file_part *part_details in prc_data_s */
+    uint8_t has_entity_ref;
+    prc_api_entity_ref entity_ref;
+    prc_api_object_style *RI_item_style_node; /* This is a pointer to the RI style tree leaf. We can traverse this backwards to get everything */
+    prc_api_attributes attributes;
+};
+
+typedef struct prc_api_markup_s
+{
+    char *name;
+    prc_api_tess *tess;
+    uint32_t biased_tess_index;
+    uint32_t biased_style_index;
+    uint32_t file_index;
+} prc_api_markup;
+
+typedef struct prc_api_product_s prc_api_product;
+struct prc_api_product_s
+{
+    uint8_t is_model;
+    prc_api_node_type_t type;
+    size_t num_children;
+    prc_api_product *children;
+    /** 1 if location holds a real (non-identity) transform, 0 if this node
+        has no placement transform (equivalent to identity). */
+    uint8_t location_set;
+    /** This node's own placement transform, relative to its PARENT node --
+        NOT a world/global transform. To get a node's world transform,
+        walk the tree from the root, accumulating each node's location into
+        a running transform via prc_api_update_transform (start the
+        accumulator at identity, e.g. via prc_api_set_transform_identity),
+        then apply the result to that node's own geometry (its part's
+        rep-items) via prc_api_transform_point. Only meaningful when
+        location_set is 1; otherwise treat as identity. */
+    prc_api_transform location;
+    char *name;
+    prc_api_part *part;
+    uint32_t num_markups;
+    prc_api_markup *markup;
+    int32_t file_index;
+    prc_api_attributes attributes;
+    void *reserved;
+};
+
+typedef struct prc_api_graphic_primitive_s
+{
+    prc_api_graphic_type_t type;
+    size_t num_indices;
+    uint32_t *indices;
+} prc_api_graphic_primitive;
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+/**
+ * @brief Create a new API context.
+ *
+ * @param hooks Optional allocation/logging hooks; pass NULL for defaults.
+ * @return A valid context pointer on success, or NULL on failure.
+ */
+PRC_EXPORT prc_context *prc_api_new_context(const prc_hooks *hooks);
+
+/**
+ * @brief Release a context and all resources owned by it.
+ *
+ * @param ctx Context returned by prc_api_new_context.
+ * @return 0 on success. May return PRC_API_MEMORY_LEAK_DETECTED when leak
+ * detection is enabled and unreleased allocations remain.
+ */
+PRC_EXPORT int prc_api_release_context(prc_context *ctx);
+
+/**
+ * @brief Print and clear the current context error stack.
+ *
+ * @param ctx Active API context.
+ */
+PRC_EXPORT void prc_api_print_error_stack(prc_context *ctx);
+
+/**
+ * @brief Open input contents (PRC or supported container) and prepare API data.
+ *
+ * @param ctx Active API context.
+ * @param infile Input file path.
+ * @return Opaque API data handle on success, NULL on failure.
+ */
+PRC_EXPORT prc_api_data prc_api_open_contents(prc_context *ctx, const char *infile);
+
+/**
+ * @brief Release API data and optional tessellation/model-tree allocations.
+ *
+ * @param ctx Active API context.
+ * @param data Data handle returned by prc_api_open_contents.
+ * @param tess Optional tessellation array previously allocated by caller.
+ * @param num_tess Number of entries in tess.
+ * @param line_tess Optional line tessellation array previously allocated by caller.
+ * @param num_line_tess Number of entries in line_tess.
+ * @param exact_tess Optional exact-geometry tessellation array previously allocated by caller.
+ * @param num_exact_tess Number of entries in exact_tess.
+ * @param product_tree Optional model tree previously allocated by caller.
+ */
+PRC_EXPORT void prc_api_release_data(prc_context *ctx, prc_api_data data, prc_api_tess *tess, uint32_t num_tess, prc_api_tess *line_tess, uint32_t num_line_tess, prc_api_tess *exact_tess, uint32_t num_exact_tess, prc_api_product *product_tree);
+
+/**
+ * @brief Print an API product tree for diagnostics.
+ *
+ * @param ctx Active API context.
+ * @param product Product subtree root to print.
+ * @param level Initial indentation level.
+ */
+PRC_EXPORT void prc_api_print_tree(prc_context *ctx, prc_api_product *product, int level);
+
+/**
+ * @brief Return number of stored camera views.
+ *
+ * @param ctx Active API context.
+ * @param data Data handle.
+ * @return Number of views in the data set.
+ */
+PRC_EXPORT uint32_t prc_api_get_number_of_view(prc_context *ctx, prc_api_data data);
+
+/**
+ * @brief Fetch view metadata and transform for one view index.
+ *
+ * @param ctx Active API context.
+ * @param data Data handle.
+ * @param view_index Zero-based view index.
+ * @param name Output view name.
+ * @param matrix Output 4x4 transform matrix pointer.
+ * @param camera_z Output camera distance along z.
+ * @return 0 on success, negative PRC_API_ERROR_* code on failure.
+ */
+PRC_EXPORT int prc_api_get_view(prc_context *ctx, prc_api_data data, uint32_t view_index, char **name, double **matrix, double *camera_z);
+
+/**
+ * @brief Get the type of tessellation from the parsed PRC data
+ *
+ * @param ctx           Active API context.
+ * @param data          Data handle from prc_api_open_contents.
+ * @param tess_index    Index of tessellation.
+ * @return              Type of tessellation (PRC_API_TESS_3D, PRC_API_TESS_3D_Compressed, etc.)
+ */
+PRC_EXPORT prc_api_tess_type_t prc_api_get_tessellation_type(prc_context *ctx, prc_api_data data, uint32_t tess_index);
+
+/**
+ * @brief Set a transform structure to identity.
+ *
+ * @param ctx Active API context.
+ * @param transform Transform object to initialize.
+ */
+PRC_EXPORT void prc_api_set_transform_identity(prc_context *ctx, prc_api_transform *transform);
+
+/**
+ * @brief Concatenate/apply a new transform into an existing transform.
+ *
+ * Column-major 4x4 composition: concate_transform = concate_transform *
+ * new_transform. For a caller walking prc_api_product's tree root-to-leaf
+ * and accumulating each node's own LOCAL (parent-relative) prc_api_product::
+ * location into a running world transform, pass the running world transform
+ * as concate_transform and the current node's own location as new_transform
+ * -- the result is the correct world transform for that node (and, applied
+ * via prc_api_transform_point, for any of its own rep-item geometry).
+ *
+ * @param ctx Active API context.
+ * @param concate_transform In/out accumulated transform.
+ * @param new_transform Transform to apply.
+ */
+PRC_EXPORT void prc_api_update_transform(prc_context *ctx, prc_api_transform *concate_transform, prc_api_transform *new_transform);
+
+/**
+ * @brief Apply a (column-major, affine) transform to a 3D point.
+ *
+ * out may alias in. If transform is NULL or transform->is_identity, out is
+ * simply set to in (cheap, no matrix math).
+ *
+ * @param transform Transform to apply, or NULL for identity.
+ * @param in Input point (world/parent space is up to the caller's own
+ *           accumulated transform -- this function only applies the ONE
+ *           transform passed in).
+ * @param out Output point, in[3] transformed by transform.
+ */
+PRC_EXPORT void prc_api_transform_point(const prc_api_transform *transform, const double in[3], double out[3]);
+
+/**
+ * @brief Get tessellation pointer for a part representation item.
+ *
+ * @param ctx Active API context.
+ * @param part Part object.
+ * @param rep_item_index Representation-item index.
+ * @return Tessellation pointer, or NULL when unavailable.
+ */
+PRC_EXPORT prc_api_tess *prc_api_get_ri_tessellation(prc_context *ctx, prc_api_part *part, uint32_t rep_item_index);
+
+/**
+ * @brief Get optional extra wire tessellation pointer for a representation item.
+ *
+ * @param ctx Active API context.
+ * @param part Part object.
+ * @param rep_item_index Representation-item index.
+ * @return Extra wire tessellation pointer, or NULL when unavailable.
+ */
+PRC_EXPORT prc_api_tess *prc_api_get_ri_line_tessellation(prc_context *ctx, prc_api_part *part, uint32_t rep_item_index);
+
+/**
+ * @brief Get a model-level tessellation associated with a product node.
+ *
+ * @param ctx Active API context.
+ * @param parent Product node.
+ * @return Tessellation pointer, or NULL when unavailable.
+ */
+PRC_EXPORT prc_api_tess* prc_api_get_model_tessellation(prc_context* ctx, prc_api_product *parent);
+
+/**
+ * @brief Get markup tessellation by index.
+ *
+ * @param ctx Active API context.
+ * @param product Product node containing markups.
+ * @param markup_index Markup index.
+ * @return Markup tessellation pointer, or NULL when unavailable.
+ */
+PRC_EXPORT prc_api_tess* prc_api_get_markup_tessellation(prc_context *ctx, prc_api_product *product, uint32_t markup_index);
+
+/**
+ * @brief Check whether a model item corresponds to a part.
+ *
+ * @param ctx Active API context.
+ * @param parent Model node.
+ * @return Non-zero if node represents a part.
+ */
+PRC_EXPORT uint8_t prc_api_model_item_is_part(prc_context *ctx, prc_api_product *parent);
+
+/**
+ * @brief Return number of markups attached to a model item.
+ *
+ * @param ctx Active API context.
+ * @param api_product Product/model node.
+ * @return Number of markups attached to the node.
+ */
+PRC_EXPORT uint32_t prc_api_model_item_number_of_markups(prc_context *ctx, prc_api_product *api_product);
+
+/**
+ * @brief Initialize one tessellation entry and optional extra-line companion.
+ *
+ * @param ctx Active API context.
+ * @param data_in Data handle from prc_api_open_contents.
+ * @param model_tree Model tree created by prc_api_create_model_tree.
+ * @param tess_index Tessellation index in prepared model data.
+ * @param api_tess Output tessellation object.
+ * @param api_tess_line Optional output for extra line tessellation.
+ * @param has_line Output flag indicating whether extra line tessellation exists.
+ * @return 0 on success, negative PRC_API_ERROR_* code on failure.
+ */
+PRC_EXPORT int prc_api_initialize_tessellation(prc_context* ctx, prc_api_data data_in, prc_api_product *model_tree, uint32_t tess_index, prc_api_tess *api_tess, prc_api_tess *api_tess_line, uint8_t *has_line);
+
+/**
+ * @brief Get counts of tessellations and extra line tessellations.
+ *
+ * @param ctx Active API context.
+ * @param data Data handle.
+ * @param modeltree Model tree root.
+ * @param num_tess Output count of tessellations.
+ * @param num_line_tess Output count of line tessellations.
+ * @param num_exact_geom_tess Output count of exact geometry tessellations.
+ * @param exact_geom_only If non-zero, ignore all stored tessellation data and
+ *        build every RI's tessellation from its exact geometry instead, even
+ *        for RIs that have stored tessellation data. Useful for debugging the
+ *        exact geometry tessellation path in isolation.
+ * @return 0 on success, negative PRC_API_ERROR_* code on failure.
+ */
+PRC_EXPORT int prc_api_get_number_tessellations(prc_context *ctx, prc_api_data data, prc_api_product *modeltree, uint32_t *num_tess, uint32_t *num_line_tess, uint32_t *num_exact_geom_tess, uint8_t exact_geom_only);
+
+/**
+ * @brief Return number of faces for a tessellation.
+ *
+ * @param ctx Active API context.
+ * @param data Data handle.
+ * @param tess_index Tessellation index.
+ * @return Number of faces for the tessellation.
+ */
+PRC_EXPORT uint32_t prc_api_get_number_faces(prc_context *ctx, prc_api_data data, uint32_t tess_index);
+
+/**
+ * @brief Return number of exact geometry objects that have been created.
+ *
+ * @param ctx Active API context.
+ * @param data Data handle.
+ * @return Number of exact geometry objects.
+ */
+PRC_EXPORT uint32_t prc_api_get_number_exact_geom_objects(prc_context *ctx, prc_api_data data);
+
+/**
+ * @brief Return number of shells in an exact geometry object.
+ *
+ * @param ctx Active API context.
+ * @param data Data handle.
+ * @param exact_geom_index Exact geometry object index.
+ * @return Number of shells in the exact geometry object.
+ */
+PRC_EXPORT uint32_t prc_api_get_number_exact_geom_shells(prc_context *ctx, prc_api_data data, uint32_t exact_geom_index);
+
+/**
+ * @brief Return number of faces in a shell in an exact geometry object.
+ *
+ * @param ctx Active API context.
+ * @param data Data handle.
+ * @param exact_geom_index Exact geometry object index.
+ * @param shell_index Shell index in the exact geometry object.
+ * @return Number of faces in the shell.
+ */
+PRC_EXPORT uint32_t prc_api_get_number_exact_geom_faces(prc_context *ctx, prc_api_data data, uint32_t exact_geom_index, uint32_t shell_index);
+
+/**
+ * @brief Build face wire primitive data for one tessellation face.
+ *
+ * @param ctx Active API context.
+ * @param data Data handle.
+ * @param tess_index Tessellation index.
+ * @param face_index Face index in tessellation.
+ * @param face_out Output face metadata.
+ * @param tess_line Output line tessellation data.
+ * @return 0 on success, negative PRC_API_ERROR_* code on failure.
+ */
+PRC_EXPORT int prc_api_get_line_tessellation_vertices(prc_context *ctx, prc_api_data data, uint32_t tess_index, uint32_t face_index, prc_api_face *face_out, prc_api_tess *tess_line);
+
+/**
+ * @brief Build tessellation vertices/primitives for one tessellation face.
+ *
+ * @param ctx Active API context.
+ * @param data_in Data handle.
+ * @param tess_index Tessellation index.
+ * @param face_index Face index in tessellation.
+ * @param face_out Output face metadata.
+ * @param api_tess Output tessellation data.
+ * @return 0 on success, negative PRC_API_ERROR_* code on failure.
+ */
+PRC_EXPORT int prc_api_get_tessellation_vertices(prc_context *ctx, prc_api_data data_in, uint32_t tess_index, uint32_t face_index, prc_api_face *face_out, prc_api_tess *api_tess);
+
+/**
+ * @brief Build tessellation vertices/primitives for exact geometry.
+ *
+ * @param ctx Active API context.
+ * @param data_in Data handle.
+ * @param api_tree Model tree root.
+ * @param geom_object_index Exact geometry object index.
+ * @param shell_index Shell index in the exact geometry object.
+ * @param face_index Face index in the shell.
+ * @param tess_index Tessellation index in the face.
+ * @param api_tess Output tessellation data.
+ * @return 0 on success, negative PRC_API_ERROR_* code on failure.
+ */
+PRC_EXPORT int prc_api_get_exact_geometry_tessellation_vertices(prc_context *ctx, prc_api_data data_in, prc_api_product *api_tree, uint32_t geom_object_index, uint32_t shell_index, uint32_t face_index, uint32_t tess_index, prc_api_tess *api_tess);
+
+/**
+ * @brief Release allocations owned by one exact-geometry API tessellation.
+ *
+ * Unlike the caller-managed tessellation arrays released through
+ * prc_api_release_data, exact-geometry tessellations may allocate their own
+ * internal face array and related buffers when materialized through
+ * prc_api_get_exact_geometry_tessellation_vertices.
+ *
+ * @param ctx Active API context.
+ * @param tess Exact-geometry tessellation object to release.
+ */
+PRC_EXPORT void prc_api_release_exact_geometry_tessellation(prc_context *ctx, prc_api_tess *tess);
+
+/**
+ * @brief Get one graphics primitive descriptor by index.
+ *
+ * @param ctx Active API context.
+ * @param data Data handle.
+ * @param tess Tessellation object.
+ * @param face_index Face index.
+ * @param graphics_primitive_index Primitive index for the face.
+ * @param graphics_primitive Output primitive descriptor.
+ * @return 0 on success, negative PRC_API_ERROR_* code on failure.
+ */
+PRC_EXPORT int prc_api_get_graphics_primitive(prc_context *ctx, prc_api_data data, const prc_api_tess *tess, uint32_t face_index, size_t graphics_primitive_index, prc_api_graphic_primitive *graphics_primitive);
+
+/**
+ * @brief Return number of graphics primitives for a tessellation object.
+ *
+ * @param ctx Active API context.
+ * @param data Data handle.
+ * @param tess Tessellation object.
+ * @return Number of graphics primitives available.
+ */
+PRC_EXPORT size_t prc_api_get_num_graphics_primitives(prc_context *ctx, prc_api_data data, const prc_api_tess *tess);
+
+/**
+ * @brief Return whether a face uses material properties.
+ *
+ * @param ctx Active API context.
+ * @param api_tess Tessellation object.
+ * @param face_index Face index.
+ * @return Non-zero when material data is present.
+ */
+PRC_EXPORT int prc_api_face_is_material(prc_context *ctx, const prc_api_tess *api_tess, uint32_t face_index);
+
+/**
+ * @brief Return whether a face should be skipped for rendering.
+ *
+ * @param ctx Active API context.
+ * @param api_tess Tessellation object.
+ * @param face_index Face index.
+ * @return Non-zero when face should be skipped.
+ */
+PRC_EXPORT uint8_t prc_api_skip_face(prc_context *ctx, const prc_api_tess *api_tess, uint32_t face_index);
+
+/**
+ * @brief Get material values for a tessellation face.
+ *
+ * @param ctx Active API context.
+ * @param api_tess Tessellation object.
+ * @param material Output material payload.
+ * @param face_index Face index.
+ */
+PRC_EXPORT void prc_api_get_face_material(prc_context *ctx, const prc_api_tess *api_tess, prc_api_material *material, uint32_t face_index);
+
+/**
+ * @brief Get one text primitive from a tessellation.
+ *
+ * @param ctx Active API context.
+ * @param data Data handle.
+ * @param tess Tessellation object.
+ * @param text_index Text primitive index.
+ * @param text_primitive Output text primitive.
+ * @return 0 on success, negative PRC_API_ERROR_* code on failure.
+ */
+PRC_EXPORT int prc_api_get_text_primitive(prc_context *ctx, prc_api_data data, const prc_api_tess *tess, uint32_t text_index, prc_api_text_primitive *text_primitive);
+
+/**
+ * @brief Return number of materials represented by a tessellation.
+ *
+ * @param ctx Active API context.
+ * @param data_in Data handle.
+ * @param tess Tessellation object.
+ * @return Number of materials represented.
+ */
+PRC_EXPORT uint32_t prc_api_number_of_materials(prc_context *ctx, prc_api_data data_in, const prc_api_tess *tess);
+
+/**
+ * @brief Return whether per-vertex material/style payload is present on a face.
+ *
+ * @param ctx Active API context.
+ * @param api_tess Tessellation object.
+ * @param face_index Face index.
+ * @return Non-zero when vertices carry style/material data.
+ */
+PRC_EXPORT uint8_t prc_api_vertices_have_material(prc_context *ctx, const prc_api_tess *api_tess, uint32_t face_index);
+
+/**
+ * @brief Get expanded face vertices for a tessellation face.
+ *
+ * @param ctx Active API context.
+ * @param tess Tessellation object.
+ * @param face_index Face index.
+ * @param vertex_count Output number of expanded vertices.
+ * @param vertices Output allocated vertex array.
+ * @return 0 on success, negative PRC_API_ERROR_* code on failure.
+ */
+PRC_EXPORT int prc_api_get_face_vertices(prc_context *ctx, const prc_api_tess *tess, uint32_t face_index, uint32_t *vertex_count, prc_api_vertex **vertices);
+
+/**
+ * @brief Precompute counts needed to allocate model tree arrays.
+ *
+ * @param ctx Active API context.
+ * @param data Data handle.
+ * @param num_parts Output part count.
+ * @param num_products Output product count.
+ * @param num_markups Output markup count.
+ * @return 0 on success, negative PRC_API_ERROR_* code on failure.
+ */
+PRC_EXPORT int prc_api_prep_model_tree(prc_context *ctx, prc_api_data data, uint32_t *num_parts, uint32_t *num_products, uint32_t *num_markups);
+
+/**
+ * @brief Build the API model tree from parsed data.
+ *
+ * @param ctx Active API context.
+ * @param data Data handle.
+ * @param parent Output root pointer for the created model tree.
+ * @param num_parts Preallocated part capacity from prc_api_prep_model_tree.
+ * @param num_products Preallocated product capacity from prc_api_prep_model_tree.
+ * @param num_markups Preallocated markup capacity from prc_api_prep_model_tree.
+ * @return 0 on success, negative PRC_API_ERROR_* code on failure.
+ */
+PRC_EXPORT int prc_api_create_model_tree(prc_context *ctx, prc_api_data data, prc_api_product **parent, uint32_t num_parts, uint32_t num_products, uint32_t num_markups);
+
+/* ------------------------------------------------------------------ */
+/* Write facility: public types.                                       */
+/*                                                                      */
+/* Not yet exposed here: per-file color/material/style/picture tables   */
+/* (globals section entries that representation items could reference  */
+/* by index) -- prc_api_write_prc_file always writes an empty table, so */
+/* every representation item gets the reader's default appearance.     */
+/* File a request upstream if you need materials/colors sooner.        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * @brief Tolerance parameter mode for encoder quantization thresholds.
+ */
+typedef enum
+{
+    /** Value is an absolute distance in millimetres, independent of model scale. */
+    PRC_WRITE_TOL_ABSOLUTE = 0,
+    /** Value is a dimensionless fraction of the model bounding-box diagonal. */
+    PRC_WRITE_TOL_RELATIVE = 1
+} prc_write_tol_mode_t;
+
+/**
+ * @brief Encoder tolerance: controls quantization grid size and weld distance.
+ *
+ * Construct via the inline helpers below rather than direct struct init.
+ */
+typedef struct prc_write_tolerance_s
+{
+    prc_write_tol_mode_t mode;
+    double               value; /* mm when ABSOLUTE; fraction when RELATIVE */
+} prc_write_tolerance;
+
+/** Construct an absolute tolerance of @p mm millimetres. */
+static PRC_INLINE prc_write_tolerance prc_write_tol_absolute(double mm)
+{
+    prc_write_tolerance t;
+    t.mode  = PRC_WRITE_TOL_ABSOLUTE;
+    t.value = mm;
+    return t;
+}
+
+/** Construct a relative tolerance of @p fraction x bbox_diagonal. */
+static PRC_INLINE prc_write_tolerance prc_write_tol_relative(double fraction)
+{
+    prc_write_tolerance t;
+    t.mode  = PRC_WRITE_TOL_RELATIVE;
+    t.value = fraction;
+    return t;
+}
+
+/**
+ * @brief Resolve a prc_write_tolerance to a concrete millimetre scalar.
+ *
+ * @param ctx           Active context (receives an error-stack entry if a
+ *                      RELATIVE tolerance is paired with a non-positive
+ *                      bounding-box diagonal).
+ * @param tol           Caller-supplied tolerance specification.
+ * @param bbox_diagonal Bounding-box diagonal of the geometry being encoded (mm).
+ * @return Resolved tolerance in mm, clamped to a 1e-7 mm (0.1 nm) practical floor.
+ */
+PRC_EXPORT double prc_write_tol_resolve(prc_context *ctx, prc_write_tolerance tol, double bbox_diagonal);
+
+/**
+ * @brief Checks whether a mesh has any vertex touched by multiple
+ * disconnected triangle "fans" (real but uncommon: usually a T-junction or
+ * duplicated-vertex artifact from the mesh's source tool, not a modeling
+ * error).
+ *
+ * PRC_API_WRITE_TESS_KIND_COMPRESSED's non-manifold-vertex handling for
+ * this specific case has an open, real-Adobe-Acrobat-confirmed
+ * compatibility issue in some Acrobat builds (root cause not yet
+ * identified as of this writing -- nanoPRC's own reader, and at least one
+ * independent PRC reader, both decode the affected output correctly).
+ * Callers building COMPRESSED entries from untrusted/arbitrary mesh
+ * sources should call this first and use PRC_API_WRITE_TESS_KIND_TRIANGLES
+ * instead whenever it returns 1, to avoid the risk. Uses the same welding
+ * tolerance and vertex-dedup logic COMPRESSED itself would use, so the
+ * check reflects what COMPRESSED would actually encode.
+ *
+ * @param ctx           Active context.
+ * @param positions     3 doubles per vertex.
+ * @param num_positions Number of vertices in @p positions.
+ * @param tri_indices   3 vertex indices per triangle (into @p positions).
+ * @param num_triangles Number of triangles in @p tri_indices.
+ * @param tolerance     Same tolerance the caller intends to pass to
+ *                      PRC_API_WRITE_TESS_KIND_COMPRESSED for this mesh.
+ * @return 1 if such a vertex exists, 0 if not, negative PRC_ERROR_* on failure.
+ */
+PRC_EXPORT int prc_api_mesh_has_nonmanifold_fans(prc_context *ctx,
+    const double *positions, uint32_t num_positions,
+    const uint32_t *tri_indices, uint32_t num_triangles,
+    prc_write_tolerance tolerance);
+
+/**
+ * @brief Welds coincident vertices (within @p tolerance, same convention
+ * PRC_API_WRITE_TESS_KIND_COMPRESSED's own encoder uses) and additionally
+ * splits any vertex touched by multiple disconnected triangle "fans" --
+ * see prc_api_mesh_has_nonmanifold_fans's own doc comment for what that
+ * means and why it matters -- into one copy per fan, instead of leaving it
+ * shared.
+ *
+ * WHY THIS EXISTS: `prc_api_mesh_has_nonmanifold_fans` only ANSWERS whether
+ * a mesh has this defect; callers that detect it and fall back to
+ * PRC_API_WRITE_TESS_KIND_TRIANGLES still need the defect actually fixed,
+ * not just diagnosed. A blunt fix -- fully expanding every triangle corner
+ * into its own private vertex, discarding ALL index sharing -- also works,
+ * but at a real cost: on ordinary real-world meshes this both roughly
+ * triples output size AND silently degrades a reader's normal
+ * reconstruction to flat/faceted shading EVERYWHERE, not just at the
+ * actual defect site, since a reader can only smooth-average normals
+ * across triangles that visibly share a vertex index. This function fixes
+ * only the specific vertices that are actually non-manifold: a mesh with,
+ * say, one such vertex gets exactly one extra position, not one extra
+ * position per triangle. Every other vertex keeps its sharing, so smooth
+ * shading is preserved everywhere except the genuinely-discontinuous split
+ * points -- where flat/faceted shading is the geometrically CORRECT result
+ * anyway, since the fans meeting there are topologically unrelated surface
+ * patches that only happen to touch at a single point.
+ *
+ * WHAT THIS DELIBERATELY DOES NOT DO: PRC_API_WRITE_TESS_KIND_COMPRESSED's
+ * own internal preprocessing also resolves edges shared by 3+ triangles
+ * (a different, more common real-world mesh-quality issue than the
+ * disconnected-fan case above), by giving each such triangle its own
+ * private copy of that edge's two endpoints. That step exists only because
+ * COMPRESSED's own EdgeBreaker-style traversal assumes at most 2 triangles
+ * per edge -- a constraint plain uncompressed TRIANGLES output does not
+ * share, since it has no such traversal. This function skips that step
+ * accordingly, and doing so matters in practice, not just in theory: on
+ * one real mechanical assembly used to validate this function, the edge
+ * step alone would have added roughly 390,000 extra vertices, against a
+ * few hundred from the fan-vertex splitting this function actually
+ * performs. If a caller does intend to hand this function's output to
+ * PRC_API_WRITE_TESS_KIND_COMPRESSED rather than _TRIANGLES, that encoder
+ * still runs its own full preprocessing (edge step included) internally
+ * regardless of what buffer it's given, so this is a safe input either
+ * way -- just not a complete substitute for COMPRESSED's own preprocessing
+ * if that specific edge case also needs handling.
+ *
+ * Degenerate (zero-area, post-weld) triangles are also removed, same as
+ * PRC_API_WRITE_TESS_KIND_COMPRESSED's own preprocessing -- so
+ * @p out_num_triangles may be less than @p num_triangles even where no
+ * splitting occurs.
+ *
+ * OWNERSHIP: the returned arrays are freshly allocated and owned by the
+ * caller. Free them with prc_api_mesh_weld_and_split_free (not a plain
+ * free()/delete[] -- they were allocated through this context's own
+ * allocator hooks, which may differ) once no longer needed, whether or not
+ * they end up handed to a write call in between.
+ *
+ * @param ctx              Active context.
+ * @param positions        3 doubles per input vertex.
+ * @param num_positions    Number of vertices in @p positions.
+ * @param tri_indices      3 vertex indices per triangle (into @p positions).
+ * @param num_triangles    Number of triangles in @p tri_indices.
+ * @param tolerance        Same tolerance the caller intends to pass to
+ *                         PRC_API_WRITE_TESS_KIND_COMPRESSED for this mesh.
+ * @param out_positions    Receives a newly allocated array, 3 doubles per
+ *                         output vertex.
+ * @param out_num_positions Receives the output vertex count.
+ * @param out_tri_indices  Receives a newly allocated array, 3 indices per
+ *                         output triangle (into *out_positions).
+ * @param out_num_triangles Receives the output triangle count.
+ * @return 0 on success, negative PRC_ERROR_* on failure (outputs left
+ *         untouched).
+ */
+PRC_EXPORT int prc_api_mesh_weld_and_split(prc_context *ctx,
+    const double *positions, uint32_t num_positions,
+    const uint32_t *tri_indices, uint32_t num_triangles,
+    prc_write_tolerance tolerance,
+    double **out_positions, uint32_t *out_num_positions,
+    uint32_t **out_tri_indices, uint32_t *out_num_triangles);
+
+/**
+ * @brief Frees arrays returned by prc_api_mesh_weld_and_split. Either
+ * pointer may be NULL (no-op for that one).
+ */
+PRC_EXPORT void prc_api_mesh_weld_and_split_free(prc_context *ctx,
+    double *positions, uint32_t *tri_indices);
+
+/**
+ * @brief Representation-item kind for prc_api_write_rep_item.
+ *
+ * SURFACE writes a PRC_TYPE_RI_PolyBrepModel representation item (a
+ * tessellated *surface* -- triangles, not exact B-Rep geometry, which this
+ * write facility does not produce). WIRE writes a PRC_TYPE_RI_PolyWire
+ * representation item (line segments / polylines).
+ */
+typedef enum
+{
+    PRC_API_WRITE_RI_SURFACE = 0,
+    PRC_API_WRITE_RI_WIRE = 1
+} prc_api_write_ri_kind_t;
+
+/**
+ * @brief One representation item attached to a prc_api_write_node.
+ *
+ * A representation item does not carry geometry itself -- it points at one
+ * entry of the tessellation array passed to prc_api_write_prc_file.
+ */
+typedef struct prc_api_write_rep_item_s
+{
+    /** SURFACE or WIRE; must match the referenced tessellation entry's kind. */
+    prc_api_write_ri_kind_t kind;
+    /** 1-based index into the prc_api_write_prc_file `tess_entries` array
+        (index 0 of that array is biased_tessellation_index == 1). A value
+        of 0 is invalid -- every representation item must reference a real
+        tessellation entry. */
+    uint32_t biased_tessellation_index;
+    /** SURFACE only: 1 if the tessellated surface is a closed (watertight)
+        shell, 0 otherwise. Ignored for WIRE. */
+    uint8_t  is_closed;
+
+    /** 1 to give this item its own material rather than the writer's shared
+        default. Leave 0 and the item is styled exactly as every item written
+        before this field existed: one shared terracotta material, which is
+        there because a genuinely styleless file stops real viewers rendering
+        at all.
+
+        A material written here becomes a GRAPH_Material with its ambient,
+        diffuse and specular slots all pointing at `color`, and its emissive
+        slot at black. That mirrors the shared default's construction, which
+        is itself the shape real producers were observed to use, and it is
+        the reason all four slots are populated: a material with an unset
+        emissive index is rejected outright when a viewer resolves it, even
+        though lighter-weight checks upstream accept it. */
+    uint8_t  has_material;
+    /** Linear RGB in 0..1, used for ambient, diffuse and specular. */
+    double   material_color[3];
+    /** Opacity in 0..1; 1 is opaque. A zero here means fully transparent,
+        not "unset" -- set it explicitly whenever has_material is 1. */
+    double   material_alpha;
+    /** Specular exponent in 0..1. 0 is legal and means a matte surface. */
+    double   material_shininess;
+
+    /* --- optional diffuse texture ---
+       Set has_texture with has_material to map an image across the item.
+       The image multiplies the material colour rather than replacing it, so
+       material_color still matters: leave it at white to see the image
+       unaltered.
+
+       The item's tessellation must supply texture coordinates. Without them
+       the reader has no UVs to sample with and the surface renders
+       untextured, which is silent rather than an error.
+
+       Only a plain 2D diffuse texture is written. Blend functions, alpha
+       testing and generated (projected) coordinates all exist in the format
+       and are refused here rather than half-written. */
+    /** 1 to attach texture_image below. Requires has_material. */
+    uint8_t  has_texture;
+    /** Raw pixels, or an encoded PNG/JPEG file, per texture_format. */
+    const uint8_t *texture_image;
+    /** Bytes at texture_image. For the raw formats only
+        texture_width*texture_height*components are read. */
+    size_t   texture_image_size;
+    /** 0 = RGB bytes, 1 = RGBA bytes, 2 = PNG file, 3 = JPEG file, matching
+        prc_api_write_texture_format. */
+    uint32_t texture_format;
+    /** Required for the raw formats; parsed from the file for PNG/JPEG.
+
+        OPEN BUG, cause not found. A texture this writer emits whose picture
+        record declares 256 or more on BOTH axes gives an empty model tree in
+        Adobe Acrobat. 255x255 renders, and so do 256x255, 256x64, 64x256,
+        512x128 and 240x272 -- one long axis is fine, two are not.
+
+        It is ours, not Acrobat's, and not the image. The same PNG bytes
+        render inside a real producer's file and fail inside ours; a real
+        256x256 PNG picture exists in third-party files and displays; and the
+        corpus holds 293 pictures with both axes at 256 or more. Ruled out by
+        fixture: file size and section layout (a 255x255 file padded to the
+        failing file's exact byte count renders), the PNG encoder (two
+        unrelated encoders behave identically), the embedded blob size (from
+        1 KB to 200 KB, all fail), the field encoding (a real file spends the
+        same 19 bits on 256), and the texture chain (style, application,
+        definition and picture records compare equal to the working file's).
+
+        JPEG is unaffected at every size tested, including 256x256 and
+        512x512, so it is the workaround until this is understood.
+
+        Worth knowing when reading 7.5.5: the spec says pixel_width and
+        pixel_height "are ignored" when format is PNG or JPEG. Acrobat does
+        not ignore them -- given a PNG whose own header disagrees with these
+        fields, it follows these. */
+    uint32_t texture_width;
+    uint32_t texture_height;
+} prc_api_write_rep_item;
+
+/** @brief texture_format values for prc_api_write_rep_item. */
+typedef enum
+{
+    PRC_API_WRITE_TEXTURE_RGB = 0,
+    PRC_API_WRITE_TEXTURE_RGBA = 1,
+    PRC_API_WRITE_TEXTURE_PNG = 2,
+    PRC_API_WRITE_TEXTURE_JPEG = 3
+} prc_api_write_texture_format;
+
+/**
+ * @brief One polyline or line segment for a WIRE tessellation entry.
+ *
+ * A line segment is an element with num_vertices == 2 and is_closed == 0.
+ * A polyline is an element with num_vertices >= 2. Setting is_closed
+ * implies a closing edge back to the first vertex; is_continuous marks
+ * that this element shares its first vertex with the previous one (a
+ * pure rendering hint -- it does not change how vertices are encoded).
+ * Vertex positions are deduplicated (exact float match) across every
+ * element of the same tessellation entry automatically.
+ */
+typedef struct prc_api_write_wire_element_s
+{
+    const float *positions;     /**< 3 floats per vertex: x, y, z. */
+    uint32_t     num_vertices;
+    uint8_t      is_closed;
+    uint8_t      is_continuous;
+    /** 4 floats (RGBA) per vertex, or NULL for no per-vertex color. If any
+        element of the tessellation entry supplies colors, every vertex of
+        every element gets a color -- elements left NULL are filled with
+        opaque white. */
+    const float *colors;
+} prc_api_write_wire_element;
+
+/**
+ * @brief Kind selector for prc_api_write_tessellation.
+ */
+typedef enum
+{
+    /** Triangulated surface, PRC_TYPE_TESS_3D (uncompressed): positions
+        stored verbatim, no welding/quantization. An independent, non-nanoPRC
+        PRC reader used for ground-truth verification reads real, exact-match
+        geometry back from files using this kind (confirmed on a
+        4096-triangle test mesh). Simpler than COMPRESSED (no welding/
+        traversal encoding to reason about) but produces larger files with no
+        vertex deduplication -- prefer COMPRESSED below for dense meshes
+        where file size/memory matter, or when you want the encoder's own
+        tolerance-based weld instead of doing it yourself. */
+    PRC_API_WRITE_TESS_KIND_TRIANGLES = 0,
+    /** Line/polyline geometry: wire_elements below. */
+    PRC_API_WRITE_TESS_KIND_WIRE = 1,
+    /** Triangulated surface, PRC_TYPE_TESS_3D_Compressed: vertex welding
+        (tolerance-based dedup), degenerate-triangle removal, and an
+        EdgeBreaker-style traversal encoding -- smaller files than TRIANGLES
+        for the same geometry, and the recommended choice for large/dense
+        meshes. Round-trips correctly through nanoPRC's own parser (including
+        large-scale stress tests). An earlier version of this comment warned
+        of a real, then-unresolved bug where an independent, non-nanoPRC PRC
+        reader returned null/empty geometry for every COMPRESSED-written
+        file; that was fixed (root cause: a large-mesh shard-corruption bug
+        in the encoder) and independently confirmed rendering correctly in
+        both Adobe Acrobat and PDF-XChange. Reads the same position/normal/
+        index/face-group fields as TRIANGLES, below, plus
+        `tolerance`/`crease_angle_degrees`. */
+    PRC_API_WRITE_TESS_KIND_COMPRESSED = 2
+} prc_api_write_tess_kind_t;
+
+/**
+ * @brief One entry of the tessellation array passed to prc_api_write_prc_file.
+ *
+ * Exactly one field group is read, selected by `kind`. There is no
+ * deduplication or quantization on the TRIANGLES path -- positions are
+ * stored as supplied; use prc_write_tol_resolve if you want to pre-weld
+ * vertices yourself before calling in. COMPRESSED reads the same
+ * position/normal/index/face-group fields as TRIANGLES but performs its
+ * own welding using `tolerance`.
+ */
+
+/**
+ * @brief One triangle fan or triangle strip.
+ *
+ * Self-describing: the group carries its own indices and its own length, so
+ * no two arrays have to be kept in step and no offset into a shared buffer
+ * has to be computed by the caller.
+ */
+typedef struct prc_api_write_tri_group_s
+{
+    /** Vertex indices into `positions`; num_vertices entries. */
+    const uint32_t *vertex_indices;
+    /** Normal indices into `normals`, num_vertices entries, or NULL for the
+        one-normal-per-group form. Must be NULL if `normals` is NULL, and is
+        ignored when must_calculate_normals is set. */
+    const uint32_t *normal_indices;
+    /** Texture-coordinate indices into `tex_coords` (in PAIRS, like
+        tri_indices' own tex_indices), num_vertices entries. Required when the
+        tessellation supplies texture coordinates and NULL otherwise. A
+        textured group must also supply normal_indices: the one-normal
+        textured forms are not written, matching the same restriction on
+        textured triangles. */
+    const uint32_t *tex_indices;
+    /** Vertices in this group; must be >= 3. A fan or strip of n vertices
+        draws n-2 triangles. */
+    uint32_t num_vertices;
+} prc_api_write_tri_group;
+
+/** @brief The fan and strip groups belonging to one face. */
+typedef struct prc_api_write_face_groups_s
+{
+    /** num_fans entries, or NULL when the face has no fans. */
+    const prc_api_write_tri_group *fans;
+    uint32_t num_fans;
+    /** num_strips entries, or NULL when the face has no strips. */
+    const prc_api_write_tri_group *strips;
+    uint32_t num_strips;
+} prc_api_write_face_groups;
+
+typedef struct prc_api_write_tessellation_s
+{
+    prc_api_write_tess_kind_t kind;
+
+    /* --- PRC_API_WRITE_TESS_KIND_TRIANGLES / _COMPRESSED --- */
+    const double *positions;       /**< 3 doubles per vertex. */
+    uint32_t      num_positions;
+    /** 3 doubles per normal, or NULL to have the encoder compute a normal
+        per face group (see face_tri_counts) instead of using a supplied
+        one: TRIANGLES computes one flat normal per face from that face's
+        first triangle (unless must_calculate_normals is set, below);
+        COMPRESSED reconstructs normals from geometry (PRC_TYPE_TESS_3D_
+        Compressed's own "recalculate normals" path). Must be NULL if
+        must_calculate_normals is set. */
+    const double *normals;
+    uint32_t      num_normals;
+    /** 3 vertex indices per triangle (into `positions`). */
+    const uint32_t *tri_indices;
+    /** 3 normal indices per triangle (into `normals`), or NULL if `normals`
+        is NULL. */
+    const uint32_t *norm_indices;
+    uint32_t      num_triangles;
+    /** Number of consecutive triangles (from tri_indices/norm_indices, in
+        order) belonging to each face group; must sum to num_triangles.
+        Each face group gets its own normal (computed or supplied). NULL/0
+        is legal for COMPRESSED (whole entry treated as one face); TRIANGLES
+        requires at least one face. */
+    const uint32_t *face_tri_counts;
+    uint32_t      num_faces;
+    /** COMPRESSED only: vertex-welding tolerance. A zero-valued tolerance
+        (the memset(0) default) resolves to prc_write_tol_relative(1e-6).
+        Ignored by TRIANGLES. */
+    prc_write_tolerance tolerance;
+    /** COMPRESSED: only when `normals` is NULL (recalculated-normals path):
+        the dihedral angle, in degrees, above which the decoder treats an
+        edge as a hard crease instead of smoothing across it. 0 resolves to
+        a default of 30 degrees. Ignored when `normals` is supplied (every
+        corner's normal is then taken exactly as given, regardless of
+        geometric creasing).
+        TRIANGLES: only when must_calculate_normals is set -- written
+        verbatim (no default substitution) as the stored crease_angle field,
+        which the *reader* applies when recomputing per-vertex normals.
+        Ignored otherwise. */
+    double crease_angle_degrees;
+    /** TRIANGLES only: if non-zero, no normal data is written at all
+        (`normals`/`norm_indices` must be NULL) -- the reader recomputes
+        per-vertex normals from geometry and crease_angle_degrees at read
+        time (PRC_TYPE_TESS_3D's own must_calculate_normals convention, the
+        convention real-world producers commonly use for this tessellation
+        type; see src/prc_write_tess_3d.h for the exact wire format).
+        Ignored for COMPRESSED and WIRE. */
+    int must_calculate_normals;
+    /** TRIANGLES only: optional texture coordinates, as num_tex_coords (u,v)
+        PAIRS -- 2 doubles each. NULL/0 writes none, which is the default and
+        was the only possibility before this field existed. Must be NULL for
+        WIRE and for COMPRESSED: the compressed encoder has no texture path,
+        and silently dropping supplied UVs would be worse than refusing them,
+        so PRC_API_WRITE_TESS_KIND_COMPRESSED rejects a non-NULL value rather
+        than ignoring it. */
+    const double *tex_coords;
+    uint32_t      num_tex_coords;
+    /** TRIANGLES only: 3 texture indices per triangle (into `tex_coords`,
+        counted in PAIRS -- index 2 means the third (u,v) pair), parallel to
+        tri_indices. Required if and only if `tex_coords` is non-NULL. Every
+        face is then written with one texture index per vertex.
+
+        Not legal together with the computed-one-normal-per-face path
+        (`normals` NULL and `must_calculate_normals` 0): that combination
+        needs PRC_FACETESSDATA_TriangleOneNormalTextured, which this
+        project's own reader currently rejects, so it is refused rather than
+        written unreadable. Supply `normals`/`norm_indices`, or set
+        `must_calculate_normals`.
+
+        Two wire-format conventions here are not stated by ISO 14739 and were
+        measured against real files before being implemented; both are filed
+        as pdf-association/pdf-issues#810. The stored coordinate count is a
+        count of DOUBLES, not of (u,v) pairs, matching how positions are
+        counted; and texture indices are stored pre-multiplied by 2, where
+        position and normal indices are pre-multiplied by 3. Neither is
+        visible through this API -- it takes pair counts and pair indices --
+        but they are why a file written here will not match a reader that
+        assumed the specification's "always a multiple of 3" claim. */
+    const uint32_t *tex_indices;
+
+    /* --- TRIANGLES: optional fan and strip primitives ---
+       A face may carry triangles, triangle fans and triangle strips at once;
+       PRC stores them as separate entity groups within the one face, in that
+       fixed order. These arrays describe the fan and strip groups; leave them
+       NULL/0 and a face is triangles only, which is what every caller written
+       before these fields existed gets.
+
+       Each face's groups are given by one prc_api_write_face_groups entry, so
+       face_groups has num_faces entries and every group states its own length
+       beside its own indices. Nothing has to be kept in step with anything
+       else.
+
+       A fan of n vertices draws n-2 triangles, all sharing vertex 0. A strip
+       of n vertices draws n-2 triangles, each sharing the previous two
+       vertices. Both need n >= 3.
+
+       Normals follow the same rule as triangles: give a group a
+       normal_indices array alongside `normals`, or leave it NULL to get the
+       one-normal-per-group form (PRC_FACETESSDATA_TriangleFanOneNormal and
+       its strip counterpart), where the group's first vertex carries the only
+       normal index and the count word is tagged with the format's
+       single-normal marker.
+
+       must_calculate_normals cannot be combined with fans or strips and is
+       refused: it is a triangles-only mode, both in this project's reader and
+       in practice -- across 307 third-party files, 6,878 entities set it and
+       7,587 carry fans or strips, and none does both. Give the groups normal
+       indices, or leave them NULL for one normal per group. */
+    /** Fan and strip groups of each face; num_faces entries, or NULL for a
+        triangles-only mesh. */
+    const prc_api_write_face_groups *face_groups;
+
+    /* --- optional RGB(A) vertex colours ---
+       TRIANGLES and WIRE. One colour per *vertex reference* in the entity
+       groups, not one per entry of `positions`: a position used by three
+       triangles is coloured three times, once for each use. That is how the
+       format stores it and how a reader counts it back, since the stored
+       array carries no count of its own.
+
+       So the expected length is the total number of vertex references the
+       tessellation describes: 3 per triangle, plus each fan's and strip's
+       vertex count. For WIRE it is one colour per point, or one per segment
+       when `vertex_colors_per_segment` is set -- a run of n points has n-1
+       segments, or n when the element closes.
+
+       The wire format delta-encodes these: the first colour in full, then one
+       bit per entry saying "same as the previous one" and a full colour only
+       when it differs. Supplying a flat array of repeated colours is therefore
+       cheap, and no caller needs to do the run-length work itself. */
+    /** 3 bytes per colour (r,g,b), or 4 (r,g,b,a) when
+        `vertex_colors_have_alpha` is set. NULL writes none. */
+    const uint8_t *vertex_colors;
+    /** Number of colours, not of bytes. */
+    uint32_t       num_vertex_colors;
+    /** 1 if `vertex_colors` holds four components per colour rather than
+        three. */
+    int            vertex_colors_have_alpha;
+    /** WIRE only: 1 to colour each segment rather than each point. Ignored
+        for TRIANGLES, where the format has no per-segment form. */
+    int            vertex_colors_per_segment;
+
+    /* --- PRC_API_WRITE_TESS_KIND_WIRE --- */
+    const prc_api_write_wire_element *wire_elements;
+    uint32_t      num_wire_elements;
+} prc_api_write_tessellation;
+
+/**
+ * @brief One node of the product/part assembly tree passed to
+ * prc_api_write_prc_file.
+ *
+ * A node with rep_items attached owns a part definition (with the given
+ * bounding box); every node -- with or without a part -- becomes one
+ * product occurrence in the output file. Nest sub-assemblies via
+ * `children`. Pass a single node with num_children == 0 for the common
+ * case of one flat part.
+ */
+typedef struct prc_api_write_node_s
+{
+    const prc_api_write_rep_item *rep_items;
+    uint32_t num_rep_items;
+    /** Axis-aligned bounding box of this node's geometry, in the same
+        units as its tessellation entries' positions.
+
+        Still written into the PartDefinition entity (and still worth
+        setting to something meaningful, e.g. the union of this node's
+        children) even when num_rep_items == 0 and has_empty_part == 1: an
+        earlier version of this comment claimed the box is "ignored" in
+        that case, on the assumption that a reader has no use for a
+        bounding box on a node with no geometry of its own. Real-Acrobat
+        testing found otherwise -- a degenerate (0,0,0)-(0,0,0) box left at
+        its zero-initialized default on an empty-part ancestor node
+        silently blanked the entire model tree beneath it, even though the
+        actual geometry a few levels further down was completely intact
+        and valid. Leaving this field zeroed for an empty-part node is not
+        a safe no-op. */
+    double bbox_min[3];
+    double bbox_max[3];
+
+    /** 1 to attach a part definition to this node even though
+        num_rep_items == 0 (an empty part -- zero representation items,
+        but still a real part entity a reader's model tree can show).
+        Ignored if num_rep_items > 0, since that already implies a part.
+        Real-world PRC producers commonly attach an empty part at every
+        intermediate assembly level down to the leaf, not just the leaf
+        itself; set this to match that shape. */
+    uint8_t has_empty_part;
+
+    /** Name of this node's product occurrence, as shown in a reader's
+        model tree (e.g. Adobe Reader/Acrobat's "Model Tree" panel), or
+        NULL for an unnamed occurrence (readers typically fall back to a
+        generic label like "node"). */
+    const char *name;
+    /** Name of this node's part definition -- the entry a reader's model
+        tree shows for the underlying geometry/body, distinct from the
+        occurrence name above. Only meaningful if num_rep_items > 0; NULL
+        for an unnamed part. */
+    const char *part_name;
+
+    /** 1 to attach a placement transform to this node (e.g. to position a
+        child within its parent's coordinate system), 0 for none. */
+    uint8_t has_transform;
+    /** Ignored if has_transform == 0. 1 means the identity transform --
+        equivalent to omitting a transform, and cheaper on the wire, so
+        prefer has_transform = 0 over has_transform = 1 with is_identity =
+        1 when you know a node is unplaced. */
+    uint8_t is_identity;
+    /** Column-major 4x4 placement matrix, used only if has_transform and
+        not is_identity. */
+    double  transform[16];
+
+    /** Array of `num_children` pointers to child nodes (sub-assemblies).
+        NULL/0 for a leaf node. */
+    struct prc_api_write_node_s * const *children;
+    uint32_t num_children;
+} prc_api_write_node;
+
+/**
+ * @brief Write a complete, single-file-structure .prc file to `filename`.
+ *
+ * This is the top-level entry point for the write facility. It encodes
+ * every entry of `tess_entries`, walks the product/part tree rooted at
+ * `root` (iteratively -- tree depth is caller data, not C call-stack
+ * depth), and assembles a full ISO 14739 PRC byte stream (schema/globals,
+ * tree, tessellation, geometry, and model-file sections, each
+ * zlib-deflated), including a correct main-header section-offset table.
+ * The result is a plain .prc file, not yet embedded in a PDF 3D annotation
+ * -- pass it to your own PDF tooling (or a future prc_pdf_embed_* entry
+ * point, not yet implemented) to get a 3D PDF.
+ *
+ * @param ctx              Active context.
+ * @param filename         Output file path.
+ * @param model_name       Name shown for the top-level "model" entry in a
+ *                         reader's model tree, or NULL to let the reader
+ *                         fall back to its own default label (e.g.
+ *                         nanoPRC's own reader assigns unnamed models the
+ *                         literal name "model").
+ * @param root             Root of the product/part tree to encode. Every
+ *                         prc_api_write_rep_item reachable from it must
+ *                         reference a valid entry of `tess_entries`.
+ * @param tess_entries     Array of tessellations referenced by rep items'
+ *                         biased_tessellation_index (1-based: entry 0 of
+ *                         this array is index 1).
+ * @param num_tess_entries Number of entries in tess_entries.
+ * @return 0 on success, negative PRC_ERROR_* code on failure (see
+ *         prc_api_print_error_stack for details).
+ */
+PRC_EXPORT int prc_api_write_prc_file(prc_context *ctx, const char *filename,
+    const char *model_name, const prc_api_write_node *root,
+    const prc_api_write_tessellation *tess_entries, uint32_t num_tess_entries);
+
+/**
+ * @brief Same encoding as prc_api_write_prc_file, but returns the complete
+ * PRC byte stream in a heap buffer instead of writing it to a file --
+ * e.g. to embed it in a PDF via prc_api_pdf_embed_prc without a round trip
+ * through disk.
+ *
+ * @param ctx              Active context.
+ * @param model_name       Name shown for the top-level "model" entry in a
+ *                         reader's model tree, or NULL to let the reader
+ *                         fall back to its own default label -- see
+ *                         prc_api_write_prc_file for the full description.
+ * @param root             Root of the product/part tree to encode -- see
+ *                         prc_api_write_prc_file for the full description.
+ * @param tess_entries     Array of tessellations referenced by rep items'
+ *                         biased_tessellation_index -- see prc_api_write_
+ *                         prc_file for the full description.
+ * @param num_tess_entries Number of entries in tess_entries.
+ * @param out_buf  Receives a buffer owned by `ctx`'s allocator; release it
+ *                 with prc_api_write_prc_buffer_free (or prc_free) when
+ *                 done. Set to NULL on failure.
+ * @param out_size Receives the buffer's length in bytes.
+ * @return 0 on success, negative PRC_ERROR_* code on failure.
+ */
+PRC_EXPORT int prc_api_write_prc_buffer(prc_context *ctx,
+    const char *model_name, const prc_api_write_node *root,
+    const prc_api_write_tessellation *tess_entries, uint32_t num_tess_entries,
+    uint8_t **out_buf, size_t *out_size);
+
+/** @brief Release a buffer returned by prc_api_write_prc_buffer. */
+PRC_EXPORT void prc_api_write_prc_buffer_free(prc_context *ctx, uint8_t *buf);
+
+/**
+ * @brief One named camera view for prc_api_pdf_embed_prc, written as a
+ * 3DView dictionary referenced from the 3D stream's view array.
+ *
+ * Camera position is given as an eye/target/up triple (the usual "look-at"
+ * form) rather than the PDF format's own camera-to-world matrix + center-
+ * of-orbit distance; the conversion is done internally. `eye == target`
+ * or `up` parallel to the view direction are degenerate and fall back to
+ * an axis-aligned default rather than producing an undefined matrix.
+ */
+typedef struct prc_pdf_view_spec_s
+{
+    /** View name, shown in a reader's view list (3DView /XN and /IN), or
+        NULL for an unnamed view. */
+    const char *name;
+    double eye[3];
+    double target[3];
+    double up[3];
+    /** 1 if this is the view a reader should show by default. If no view
+        in the array sets this, the first entry is used. */
+    uint8_t is_default;
+} prc_pdf_view_spec;
+
+/**
+ * @brief Options for prc_api_pdf_embed_prc. A NULL options pointer (or any
+ * zero-valued field) selects the stated default.
+ */
+typedef struct prc_pdf_write_options_s
+{
+    double page_width_pt;   /**< 0 => 792 (11in landscape width, points).
+                                  Pass an explicit height greater than the
+                                  width for a portrait page instead --
+                                  there is no separate orientation flag. */
+    double page_height_pt;  /**< 0 => 594 (4:3-aspect landscape height,
+                                  points; long edge is the 11in width). */
+    double margin_pt;       /**< 0 => 36 (half an inch). */
+    /** Named views to embed, or NULL/0 for none -- in which case the 3D
+        stream carries no view array at all and a reader falls back to its
+        own auto-framed default view rather than one built from a guessed
+        camera position. */
+    const prc_pdf_view_spec *views;
+    uint32_t num_views;
+} prc_pdf_write_options;
+
+/**
+ * @brief Embed an in-memory PRC byte stream into a new, minimal, single-
+ * page PDF 1.7 file as a standard (ISO 32000) 3D annotation -- the same
+ * mechanism the PDF files under examples/ in this repository already use,
+ * and the one nanoPRC's own PDF reader (prc_api_open_contents on a .pdf
+ * path) already round-trips.
+ *
+ * The page has no static content of its own; the 3D view fills the
+ * annotation's rectangle (page size minus margins), with a solid light-
+ * blue placeholder appearance shown outside interactive 3D viewers (e.g.
+ * printing or thumbnailing) in place of the live 3D content.
+ *
+ * @param ctx      Active context.
+ * @param pdf_path Output file path.
+ * @param prc_data Complete PRC byte stream to embed (e.g. from
+ *                 prc_api_write_prc_buffer, or read from an existing
+ *                 .prc file) -- copied into the output file as-is, with
+ *                 no additional PDF-level compression (PRC's own sections
+ *                 are already zlib-deflated).
+ * @param prc_size Length of prc_data in bytes.
+ * @param options  Page/margin/view configuration, or NULL for defaults
+ *                 (Letter page, half-inch margins, no named views).
+ * @return 0 on success, negative PRC_ERROR_* code on failure.
+ */
+PRC_EXPORT int prc_api_pdf_embed_prc(prc_context *ctx, const char *pdf_path,
+    const uint8_t *prc_data, size_t prc_size, const prc_pdf_write_options *options);
+
+#ifdef __cplusplus
+}
+#endif
+
+/** @} */
+
+#endif

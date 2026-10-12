@@ -1,0 +1,1461 @@
+/* Copyright (C) 2023-2026 CascadiaVoxel LLC
+
+    nanoPRC is free software: you can redistribute it and/or modify it under
+    the terms of the GNU Affero General Public License as published by the
+    Free Software Foundation, either version 3 of the License, or (at your
+    option) any later version.
+
+    nanoPRC is distributed in the hope that it will be useful, but WITHOUT
+    ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+    FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public
+    License for more details.
+
+    You should have received a copy of the GNU Affero General Public License
+    along with nanoPRC. If not, see <https://www.gnu.org/licenses/>.
+*/
+
+//#define PRC_COUNT_BIT
+
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include "prc_diag_env.h"
+#include "prc_data.h"
+#include "prc_bit.h"
+#include "prc_double.h"
+#include "debug.h"
+#include "prc_parse_common.h"
+
+/* prc_next_bit and prc_bitread_bit now live in prc_bit.h as static inline
+   (see PERF-1 in the review action plan) so every translation unit that reads
+   the bitstream can inline the hottest per-bit call instead of paying a real
+   cross-TU function call for it. */
+
+inline static void
+prc_next_huff_bit(prc_context *ctx, prc_bit_state *state)
+{
+    if (state->bitmask == 0x80)
+    {
+        state->ptr += 1;
+        state->bitmask = 0x01;
+    }
+    else
+    {
+        state->bitmask <<= 1;
+    }
+}
+
+void
+prc_init_huff_bit_state(prc_context *ctx, prc_bit_state *state, uint8_t* ptr, int64_t max_bits)
+{
+    state->ptr = ptr;
+    state->bitmask = 0x01;
+    state->bit_count = max_bits;
+    state->bit_position = 0;
+    state->overrun = 0;
+    state->curr_name = NULL;
+}
+
+void
+prc_init_bit_state(prc_context *ctx, prc_bit_state *state, uint8_t *ptr, size_t byte_count)
+{
+    state->ptr = ptr;
+    state->bitmask = 0x80;
+    state->bit_count = (int64_t) byte_count * 8;
+    state->bit_position = 0;
+    state->overrun = 0;
+    state->curr_name = NULL;
+
+#if 1
+   // if (ctx->reset_graphics_state)
+   // {
+        state->graphics_content.behavior_bit_field1 = 0;
+        state->graphics_content.behavior_bit_field2 = 0;
+        state->graphics_content.biased_index_of_line_style = 0;
+        state->graphics_content.biased_layer_index = 0;
+        state->graphics_content.has_entity_ref = 0;
+       // ctx->reset_graphics_state = 0;
+   // }
+#endif
+}
+
+void prc_bitread_rewind(prc_context *ctx, prc_bit_state *state, uint8_t backup_bits)
+{
+    while (backup_bits > 0)
+    {
+        if (state->bitmask == 0x80)
+        {
+            state->ptr--;
+            state->bitmask = 0x01;
+            backup_bits = backup_bits - 1;
+        }
+        else
+        {
+            state->bitmask = state->bitmask << 1;
+            backup_bits = backup_bits - 1;
+        }
+    }
+}
+
+/* The manual, breakpoint-only bitstream search aids that used to live here
+   (prc_debug_stream, prc_debug_view_stream_bounding_box_search,
+   prc_debug_view_stream_on_byte_boundary) moved to prc_bit_debug.c -- this
+   file is the hottest per-bit read path in the parser (see PERF-1) and
+   shouldn't carry ~150 lines of unused debug scaffolding inline. */
+
+static uint8_t
+prc_bitread_huff_bit(prc_context *ctx, prc_bit_state *state)
+{
+    uint8_t bit;
+
+    if (PRC_UNLIKELY(state->bit_count <= 0))
+    {
+        /* Same rationale as prc_bitread_bit: num_values/num_leaves etc. are
+           file-controlled and must not be able to walk this reader past the
+           end of the huffman_array buffer. */
+        state->overrun = 1;
+        return 0;
+    }
+
+    bit = *(state->ptr) & state->bitmask;
+    prc_next_huff_bit(ctx, state);
+    state->bit_count--;
+
+    if (bit > 0)
+        return 1;
+    else
+        return 0;
+}
+
+uint8_t
+prc_bitread_uint8(prc_context *ctx, prc_bit_state *state)
+{
+    uint8_t val = 0;
+    int k;
+
+    val |= prc_bitread_bit(ctx, state);
+    for (k = 0; k < 7; k++)
+    {
+        val <<= 1;
+        val |= prc_bitread_bit(ctx, state);
+    }
+    return val;
+}
+
+uint32_t
+prc_bitread_uint32(prc_context *ctx, prc_bit_state *state)
+{
+    uint32_t val = 0;
+    uint32_t pos = 0;
+
+    while (prc_bitread_bit(ctx, state))
+    {
+        val |= (((uint32_t)(prc_bitread_uint8(ctx, state))) << (8 * pos++));
+    }
+    return val;
+}
+
+int32_t
+prc_bitread_int32(prc_context *ctx, prc_bit_state *state)
+{
+    uint32_t val = 0;
+    uint32_t pos = 0;
+
+    while (prc_bitread_bit(ctx, state))
+    {
+        if (pos >= 4)
+            break;
+        val |= (((uint32_t)(prc_bitread_uint8(ctx, state))) << (8 * pos++));
+    }
+
+    /* Sign-extend from the top bit of the last byte read.
+
+       Clause 9.12 "WriteInteger" stops emitting bytes at
+           (iValue ==  0 && (loc & 0x80) == 0) ||
+           (iValue == -1 && (loc & 0x80) != 0)
+       where iValue is shifted arithmetically. That terminating condition is a
+       sign-extension contract: the writer stops as soon as the remaining bits
+       are all copies of the last byte's high bit, and the reader is expected
+       to restore them. So -1 occupies a single 0xFF byte, and every negative
+       value is stored in the fewest bytes that preserve its sign.
+
+       This used to be a shift pair -- val <<= (4-pos)*8 then val >>= (4-pos)*8
+       -- which is the right idea applied to the wrong type: val is uint32_t,
+       so the right shift zero-fills instead of propagating the sign, and every
+       negative value came back as its unsigned bit pattern. A one-byte -1 read
+       as 255. Nothing desynced, because the bit count is unaffected either
+       way, which is why this survived: it is a value defect that no alignment
+       check can see.
+
+       The shift pair also had no defined behaviour when the loop read no bytes
+       at all, shifting a 32-bit value by 32; pos == 0 is handled separately
+       now. The pos >= 4 guard above stops a malformed run of continuation bits
+       from shifting past the width of val. */
+    if (pos == 0)
+        return 0;
+    if (pos < 4 && (val & (1u << (pos * 8u - 1u))) != 0)
+        val |= (uint32_t)(0xFFFFFFFFu << (pos * 8u));
+
+    return (int32_t)val;
+}
+
+int32_t
+prc_bitread_uncompressed_uint32(prc_context *ctx, prc_bit_state *state)
+{
+    uint32_t val;
+
+    val = prc_bitread_uint8(ctx, state);
+    val += (((uint32_t)prc_bitread_uint8(ctx, state)) << 8);
+    val += (((uint32_t)prc_bitread_uint8(ctx, state)) << 16);
+    val += (((uint32_t)prc_bitread_uint8(ctx, state)) << 24);
+
+    return val;
+}
+
+int
+prc_bitread_string(prc_context *ctx, prc_bit_state *state, prc_string* string)
+{
+    unsigned int k;
+
+    string->null_flag = prc_bitread_bit(ctx, state);
+    string->string = NULL;
+    if (string->null_flag)
+    {
+        string->size = prc_bitread_uint32(ctx, state);
+
+        /* string->size is attacker-controlled. Guard against size+1 wrapping to 0
+           (which would allocate a near-empty buffer while the fill loop below still
+           runs `size` iterations), and against a size that couldn't possibly be
+           backed by the remaining input (each character consumes at least 1 bit). */
+        if (string->size == UINT32_MAX || (int64_t)string->size > state->bit_count)
+        {
+            prc_error(ctx, PRC_ERROR_PARSE, "Invalid string size in prc_bitread_string\n");
+            return PRC_ERROR_PARSE;
+        }
+
+        string->string = (unsigned char*)prc_malloc(ctx, string->size + 1);
+        if (string->string == NULL)
+        {
+            prc_error(ctx, PRC_ERROR_MEMORY, "Allocation error in prc_bitread_string\n");
+            return PRC_ERROR_MEMORY;
+        }
+
+        /* Lets hope the character array is not Huffman compressed... Spec is horrid */
+        for (k = 0; k < string->size; k++)
+        {
+            string->string[k] = prc_bitread_uint8(ctx, state);
+        }
+        string->string[string->size] = 0x0;
+        string->null_flag = 0;
+    }
+    return 0;
+}
+
+float
+prc_bitread_float(prc_context *ctx, prc_bit_state *state)
+{
+    union float_uint val;
+
+    val.uint_val = prc_bitread_uint8(ctx, state);
+    val.uint_val += (((uint32_t)prc_bitread_uint8(ctx, state)) << 8);
+    val.uint_val += (((uint32_t)prc_bitread_uint8(ctx, state)) << 16);
+    val.uint_val += (((uint32_t)prc_bitread_uint8(ctx, state)) << 24);
+
+    return val.float_val;
+}
+
+double
+prc_bitread_double_with_variable_bit_number(prc_context *ctx, prc_bit_state *state,
+    unsigned int number_of_bits, double tolerance)
+{
+    uint8_t is_negative;
+    uint32_t mantissa;
+
+    /* number_of_bits is the whole field, sign bit included, so a zero width
+       describes nothing at all -- and subtracting one from it wraps. Callers
+       take the width straight from the bitstream (point_number_bits and
+       tangent_number_bits in the Hermite curve, among others), so a misread
+       reaches here as a legitimate-looking zero. Rejected explicitly here as
+       well as in prc_bitread_uint_variable_bit, because the wrap is this
+       function's arithmetic and the reason is only obvious at this site. */
+    if (number_of_bits == 0)
+    {
+        prc_error(ctx, PRC_ERROR_PARSE,
+            "A compressed double with a zero-bit field width carries neither a sign "
+            "nor a mantissa\n");
+        state->overrun = 1;
+        return 0.0;
+    }
+
+    is_negative = prc_bitread_bit(ctx, state);
+    mantissa = prc_bitread_uint_variable_bit(ctx, state, number_of_bits - 1);
+
+    return tolerance * (is_negative ? -1.0 : 1.0) * (double)mantissa;
+}
+
+double
+prc_bitread_double(prc_context *ctx, prc_bit_state *state)
+{
+    union ieee754_double value;
+    value.d = 0;
+    const sCodageOfFrequentDoubleOrExponent* pcofdoe;
+    unsigned int ucofdoe = 0;
+    for (int i = 1; i <= 22; ++i)
+    {
+        ucofdoe <<= 1;
+        ucofdoe |= prc_bitread_bit(ctx, state);
+        if ((pcofdoe = get_acofdoe_value(ctx, ucofdoe, i)) != NULL)
+            break;
+    }
+
+    /* Unreachable today, and kept deliberately. The loop assigns pcofdoe every
+       iteration, so falling out of it without a match leaves it NULL and the
+       dereferences below would read through it.
+
+       That cannot currently happen: prc_acofdoe is a COMPLETE prefix code, so
+       every possible bit path terminates at an entry within 22 bits. Measured
+       over the table on 23 September 2026 -- 2,077 entries, Kraft sum exactly
+       1, zero prefix collisions -- so this branch cannot be triggered by any
+       input, however malformed.
+
+       It exists because that guarantee lives in a data table rather than in
+       this code. Adding or removing a prc_double.c entry breaks the Kraft sum
+       silently, and the first symptom would be a null dereference here on
+       whichever bit pattern the edit orphaned. This turns that into a parse
+       error. Do not remove it on the grounds that it never fires -- that is
+       the point. If it ever does fire, the table has stopped being complete.
+
+       Marking the stream invalid matches what
+       prc_bitread_double_with_variable_bit_number does for its own impossible
+       input, rather than returning a plausible 0.0 a caller would store as a
+       real coordinate. */
+    if (pcofdoe == NULL)
+    {
+        prc_error(ctx, PRC_ERROR_PARSE,
+            "No compact-double prefix code matches the next 22 bits; the stream is "
+            "not positioned on a double\n");
+        state->overrun = 1;
+        return 0.0;
+    }
+
+    value.d = pcofdoe->u2uod.Value;
+
+    // check if zero
+    if (pcofdoe->NumberOfBits == 2 && pcofdoe->Bits == 1 && pcofdoe->Type == VT_double)
+        return value.d;
+
+    value.ieee.negative = prc_bitread_bit(ctx, state); // get sign
+
+    if (pcofdoe->Type == VT_double) // double from list
+        return value.d;
+
+    if (prc_bitread_bit(ctx, state) == 0) // no mantissa
+        return value.d;
+
+    // read the mantissa
+    // read uppermost 4 bits of mantissa
+    unsigned char b4 = 0;
+    for (int i = 0; i < 4; ++i)
+    {
+        b4 <<= 1;
+        b4 |= prc_bitread_bit(ctx, state);
+    }
+
+#ifdef PRC_BIG_ENDIAN
+    *((unsigned char*)(&value) + 1) |= b4;
+    unsigned char* lastByte = (unsigned char*)(&value) + 7;
+    unsigned char* currentByte = (unsigned char*)(&value) + 2;
+#else
+    *((unsigned char*)(&value) + 6) |= b4;
+    unsigned char* lastByte = (unsigned char*)(&value) + 0;
+    unsigned char* currentByte = (unsigned char*)(&value) + 5;
+#endif
+
+    for (; MOREBYTE(currentByte, lastByte); NEXTBYTE(currentByte))
+    {
+        if (prc_bitread_bit(ctx, state))
+        {
+            // new byte
+            *currentByte = prc_bitread_uint8(ctx, state);
+        }
+        else
+        {
+            // get 3 bit offset
+            unsigned int offset = 0;
+            offset |= (prc_bitread_bit(ctx, state) << 2);
+            offset |= (prc_bitread_bit(ctx, state) << 1);
+            offset |= prc_bitread_bit(ctx, state);
+            if (offset == 0)
+            {
+                // fill remaining bytes in mantissa with previous byte
+                unsigned char pByte = BYTEAT(currentByte, 1);
+                for (; MOREBYTE(currentByte, lastByte); NEXTBYTE(currentByte))
+                    *currentByte = pByte;
+                break;
+            }
+            else if (offset == 6)
+            {
+                // fill remaining bytes except last byte with previous byte
+                unsigned char pByte = BYTEAT(currentByte, 1);
+                PREVIOUSBYTE(lastByte);
+                for (; MOREBYTE(currentByte, lastByte); NEXTBYTE(currentByte))
+                    *currentByte = pByte;
+                *currentByte = prc_bitread_uint8(ctx, state);
+                break;
+            }
+            else
+            {
+                // one repeated byte
+                //
+                // offset is an untrusted 3-bit value (1-5 or 7 here; 0 and 6
+                // are handled above) read straight from the input stream.
+                // BYTEAT(currentByte, offset) dereferences currentByte+offset
+                // (little-endian) or currentByte-offset (big-endian) with no
+                // relation to how far the loop has actually progressed, so a
+                // large offset early in the loop can point past the 8-byte
+                // `value` union. Treat an out-of-range offset the same as the
+                // offset==0 case (fill the remaining mantissa bytes with the
+                // previous byte) instead of reading out of bounds.
+                unsigned char *value_bytes = (unsigned char*)&value;
+#ifdef PRC_BIG_ENDIAN
+                uint8_t in_range = (currentByte - value_bytes) >= (ptrdiff_t)offset;
+#else
+                uint8_t in_range = (currentByte + offset) <= (value_bytes + sizeof(value) - 1);
+#endif
+                if (!in_range)
+                {
+                    unsigned char pByte = BYTEAT(currentByte, 1);
+                    for (; MOREBYTE(currentByte, lastByte); NEXTBYTE(currentByte))
+                        *currentByte = pByte;
+                    break;
+                }
+                *currentByte = BYTEAT(currentByte, offset);
+            }
+        }
+    }
+    return value.d;
+}
+
+uint32_t
+prc_bitread_huff_data(prc_context *ctx, prc_bit_state *state, uint32_t num_bits)
+{
+    uint32_t k;
+    uint32_t val = 0;
+
+    for (k = 0; k < num_bits; k++)
+    {
+        val += (prc_bitread_huff_bit(ctx, state) << k);
+    }
+    return val;
+}
+
+/* Huffman decoder. Can be used to decode data of different bit lengths on the leaves.
+*  This particular implemenation can support char (1 byte) or short (2 byte) arrays
+*  as input to the encoder, and compresses them using a number of bits that depends
+*  upon the maximum value that the array contains.  This number of bits used,
+*  is specified by the data type. For example, for the Edge_status_array the number
+*  is equal to 2.  In that case, it is writing out a character array each with 2 bits
+*  per character.  normal_angle_array is a shortarray with 16bits per character.
+*  Data values are written into an elem_size-wide buffer (1 or 4 bytes -- the only
+*  two widths any caller needs); data could have been smaller when compressed.
+*  The characterArray, shortArray, character_array_compressed
+*
+*  Here is some types and bit sizes that the spec says:
+*
+*  CharacterArray
+*  point_color_array --> CharacterArray  8 bits.  Is it compressed?
+*  behaviors_array --> CharacterArray 8 bits.  Is it compressed?
+*  edge_status_array --> CharacterArray with 2 bits per character. Is it huffman compressed?
+*  character_array (character_array_compressed) 6 bits.  I guess if a character array is compressed it uses 6 bits.
+*  point_reference_array --> CompressedIndiceArray.  An odd one with the flag of it being compressed specified if number_of_reference_points >= 3 is from CompressedIndiceArray type.
+*  normal_angle_array (normal_angle_array_compressed) optionally compressed using normal_angle_number_of_bits.  Is should be lower than 16 and set to 10 for good performance
+*
+* ShortArray
+* normal_angle_array, line_attribute_array, line_attribute_array  --> is compressed bit will tell if data is compressed and using huffman. But what is the number of bits used?
+*
+* point_array -> CompressedIntegerArray
+*
+* CompressedIndiceArray  --> invokes WriteCharacterArray but with out having written if the data is compressed or not. It is impled from the number of reference_points.
+* point_reference_array, triangle_face_array
+*
+* This is the shared implementation behind prc_huffman_data_decoder (elem_size 4,
+* used by prc_bitread_short_array) and the compressed branch of
+* prc_bitread_character_array (elem_size 1) -- those two used to be ~250 lines
+* of independently-maintained duplicated logic (S1 in the encode/decode review
+* action plan), differing only in this output element width. Consolidated here
+* so a future fix (like the num_leaves==0/max_code_length-error-code cleanup
+* folded in below) only needs to happen once.
+*/
+
+/* PRC_DIAG_HUFF_DUMP: append one Huffman code table, with the symbol
+   frequencies that produced it, to the file named by the variable.
+
+   The producer's own stored table -- per leaf, its value, code length and code
+   value -- is live only inside prc_huffman_decode_core: it is read from the
+   bitstream, used to build the tree, and freed. Nothing else in the library
+   exposes it. Pairing it with the frequencies implied by the decoded array
+   makes every Huffman-coded array in a real file a labelled test case ("these
+   frequencies produced this table"), which is what settles questions about the
+   required tree shape and the equal-frequency tie-break in the absence of a
+   defined HuffmanTreeCalculation (see pdf-issues #770).
+
+   Format, tab-separated, one array per A record followed by num_leaves L records:
+
+     A <tag> <seq> <num_bits> <elem_size> <num_leaves> <max_code_length> <num_values>
+     L <leaf_value> <code_length> <code_value> <frequency>
+
+   Frequencies are counted through a small open-addressed table keyed on the
+   leaf value, so the working set is bounded by num_leaves. A direct-indexed
+   histogram over the value range is simpler but allocates with the value
+   RANGE rather than the leaf count, which on arrays carrying sparse high
+   values reaches tens of megabytes per call and can run a corpus sweep out of
+   memory. */
+static void
+prc_huff_dump_table(prc_context *ctx, const char *path, uint8_t num_bits,
+    size_t elem_size, uint32_t num_leaves, uint32_t max_code_length,
+    uint32_t num_values, const uint32_t *leaf_values,
+    const uint32_t *code_length, const uint32_t *code_values,
+    const void *data)
+{
+    static unsigned long huff_dump_seq = 0;
+    const char *tag;
+    FILE *fp;
+    uint32_t *slot_value = NULL;
+    uint32_t *slot_leaf = NULL;
+    uint32_t *freq = NULL;
+    uint32_t mask, cap = 8;
+    uint32_t i;
+
+    if (path == NULL || path[0] == '\0' || num_leaves == 0)
+        return;
+
+    while (cap < num_leaves * 2u && cap < (1u << 30))
+        cap <<= 1;
+    mask = cap - 1u;
+
+    slot_value = (uint32_t *)prc_calloc(ctx, cap, sizeof(uint32_t));
+    slot_leaf = (uint32_t *)prc_calloc(ctx, cap, sizeof(uint32_t));
+    freq = (uint32_t *)prc_calloc(ctx, num_leaves, sizeof(uint32_t));
+    if (slot_value == NULL || slot_leaf == NULL || freq == NULL)
+        goto cleanup;
+
+    /* slot_leaf holds leaf index + 1, so zero means empty. */
+    for (i = 0; i < num_leaves; i++)
+    {
+        uint32_t h = (leaf_values[i] * 2654435761u) & mask;
+
+        while (slot_leaf[h] != 0)
+        {
+            if (slot_value[h] == leaf_values[i])
+                break;
+            h = (h + 1u) & mask;
+        }
+        if (slot_leaf[h] == 0)
+        {
+            slot_value[h] = leaf_values[i];
+            slot_leaf[h] = i + 1u;
+        }
+    }
+
+    for (i = 0; i < num_values; i++)
+    {
+        uint32_t v = (elem_size == sizeof(uint8_t))
+            ? (uint32_t)((const uint8_t *)data)[i]
+            : ((const uint32_t *)data)[i];
+        uint32_t h = (v * 2654435761u) & mask;
+
+        while (slot_leaf[h] != 0)
+        {
+            if (slot_value[h] == v)
+            {
+                freq[slot_leaf[h] - 1u]++;
+                break;
+            }
+            h = (h + 1u) & mask;
+        }
+    }
+
+    fp = fopen(path, "ab");
+    if (fp != NULL)
+    {
+        tag = prc_diag_getenv("PRC_DIAG_HUFF_TAG");
+        fprintf(fp, "A\t%s\t%lu\t%u\t%u\t%u\t%u\t%u\n",
+            (tag != NULL) ? tag : "?", huff_dump_seq++,
+            (unsigned)num_bits, (unsigned)elem_size,
+            num_leaves, max_code_length, num_values);
+        for (i = 0; i < num_leaves; i++)
+            fprintf(fp, "L\t%u\t%u\t%u\t%u\n",
+                leaf_values[i], code_length[i], code_values[i], freq[i]);
+        fclose(fp);
+    }
+
+cleanup:
+    prc_free(ctx, slot_value);
+    prc_free(ctx, slot_leaf);
+    prc_free(ctx, freq);
+}
+
+static void *
+prc_huffman_decode_core(prc_context *ctx, prc_bit_state *state, uint8_t num_bits,
+    uint32_t huffman_array_size, size_t elem_size, uint32_t *data_decode_size)
+{
+    uint32_t k;
+    void *data;
+    uint32_t *huffman_array = NULL;
+    uint32_t bits_last_integer;
+    prc_bit_state huff_state;
+    uint32_t num_leaves;
+    uint32_t max_code_length;
+    uint32_t *leaf_values;
+    uint32_t *code_length;
+    uint32_t *code_values;
+    uint32_t bit_mask, bit;
+    int j;
+    prc_huff_node *root_node;
+    prc_huff_node *curr_node;
+    uint32_t num_values;
+    uint32_t index;
+    size_t max_bits;
+    prc_huff_node *node_arena = NULL;
+    uint64_t node_arena_capacity;
+    uint64_t node_arena_used = 0;
+
+    if (huffman_array_size == 0)
+    {
+        prc_error(ctx, PRC_ERROR_PARSE, "huffman_array_size is zero\n");
+        return NULL;
+    }
+
+    /* Each element is read via prc_bitread_uncompressed_uint32 below, a
+       fixed 32 bits per word; reject a huffman_array_size that couldn't
+       possibly be backed by what's left of the stream so a single
+       corrupted length field can't drive an arbitrarily large calloc
+       before any of it is validated (same pattern/precedent as the
+       tess_count fix, prc_parse_file_structure.c ~line 749). */
+    if (state->bit_count <= 0 ||
+        (uint64_t)huffman_array_size > (uint64_t)state->bit_count / 32)
+    {
+        prc_error(ctx, PRC_ERROR_PARSE, "huffman_array_size implausible for remaining section size\n");
+        return NULL;
+    }
+
+    huffman_array = (uint32_t *)prc_calloc(ctx, huffman_array_size, sizeof(uint32_t));
+    if (huffman_array == NULL)
+    {
+        prc_error(ctx, PRC_ERROR_MEMORY, "Allocation error of huffman_array\n");
+        return NULL;
+    }
+
+    for (k = 0; k < huffman_array_size; k++)
+    {
+        huffman_array[k] = prc_bitread_uncompressed_uint32(ctx, state);
+    }
+    bits_last_integer = prc_bitread_uint32(ctx, state);
+
+    /* Total bits actually available in huffman_array. Everything read from
+       huff_state below is bounded against this so a crafted num_leaves/num_values
+       cannot walk the reader past the end of huffman_array. */
+    max_bits = (size_t)(huffman_array_size - 1) * 32 + bits_last_integer;
+
+    /* Now take the huffman array apart into the values, codes and code lengths */
+    /* Everything is bit compressed.  And of course it is encoded different
+       than the rest of the data, hence the special _huff_ calls.  The spec
+       obfuscates this fact.  Madness. */
+    prc_init_huff_bit_state(ctx, &huff_state, (uint8_t *)huffman_array, (int64_t)max_bits);
+
+    /* First read in huffman array */
+    num_leaves = prc_bitread_huff_data(ctx, &huff_state, num_bits + 1);
+
+    max_code_length = prc_bitread_huff_data(ctx, &huff_state, 8);
+    /* The 32 is ours, not the format's, and it is load-bearing. Do not relax it.
+
+       The field is written on 8 bits, so the encoding admits values up to 255
+       (see the reference writer in the TWG working source,
+       iso-prc/code/huffman.cpp, which emits it with an 8-iteration loop). That
+       makes this look like an over-strict check rejecting a legal file, and a
+       real corpus file does declare 89 here, with num_leaves 421 and
+       num_bits 8.
+
+       It was tried, on 23 September 2026: raising the bound to 255 turns this
+       clean refusal into a crash -- exit 3, no output at all. The same
+       reference implementation stores each leaf's code value in an `unsigned`,
+       so a code longer than 32 bits cannot be represented by the format's own
+       writer either. A declared length above 32 therefore means the bitstream
+       has gone wrong, not that a deeper tree needs supporting.
+
+       If you are here because a file you believe to be valid is rejected:
+       measure what the parse does *before* this point rather than widening the
+       bound. */
+    if (max_code_length == 0 || max_code_length > 32)
+    {
+        prc_error(ctx, PRC_ERROR_PARSE, "huffman_array max_code_length is invalid\n");
+        prc_free(ctx, huffman_array);
+        return NULL;
+    }
+
+    /* Each leaf consumes at least num_bits + max_code_length bits; reject a
+       leaf count that could not possibly be backed by the remaining data
+       instead of allocating/looping on an attacker-chosen huge count, and
+       reject zero leaves (used below as a node-array size). */
+    if (huff_state.overrun || num_leaves == 0 ||
+        (uint64_t)num_leaves * ((uint64_t)num_bits + max_code_length) > (uint64_t)max_bits)
+    {
+        prc_error(ctx, PRC_ERROR_PARSE, "huffman_array num_leaves is invalid\n");
+        prc_free(ctx, huffman_array);
+        return NULL;
+    }
+
+    leaf_values = (uint32_t *)prc_calloc(ctx, num_leaves, sizeof(uint32_t));
+    if (leaf_values == NULL)
+    {
+        prc_error(ctx, PRC_ERROR_MEMORY, "Allocation error of huffman leaf_values\n");
+        prc_free(ctx, huffman_array);
+        return NULL;
+    }
+
+    code_length = (uint32_t *)prc_calloc(ctx, num_leaves, sizeof(uint32_t));
+    if (code_length == NULL)
+    {
+        prc_error(ctx, PRC_ERROR_MEMORY, "Allocation error of huffman code_length\n");
+        prc_free(ctx, huffman_array);
+        prc_free(ctx, leaf_values);
+        return NULL;
+    }
+
+    code_values = (uint32_t *)prc_calloc(ctx, num_leaves, sizeof(uint32_t));
+    if (code_values == NULL)
+    {
+        prc_error(ctx, PRC_ERROR_MEMORY, "Allocation error of huffman code_values\n");
+        prc_free(ctx, huffman_array);
+        prc_free(ctx, leaf_values);
+        prc_free(ctx, code_length);
+        return NULL;
+    }
+
+    for (k = 0; k < num_leaves; k++)
+    {
+        leaf_values[k] = prc_bitread_huff_data(ctx, &huff_state, num_bits);
+        code_length[k] = prc_bitread_huff_data(ctx, &huff_state, max_code_length);
+        code_values[k] = prc_bitread_huff_data(ctx, &huff_state, code_length[k]);
+    }
+
+    /* DIAGNOSTIC (2026-07-24, PRC_DIAG_READ_HUFF_TABLE): dumps the actual
+       leaf-value/code-length/code-value table as READ from an arbitrary
+       (including third-party-encoded) file's huffman_array, for comparing
+       table SHAPE against nanoPRC's own writer output -- added while
+       cross-checking the mixed_chains/fan8 Acrobat blank-tree investigation
+       against an independent encoder's file that hits the same superficial
+       "22-bit value + tie among other leaves" condition yet works in real
+       Acrobat. Zero behavior change when unset. */
+    if (prc_diag_getenv("PRC_DIAG_READ_HUFF_TABLE") != NULL)
+    {
+        fprintf(stderr, "PRC_DIAG_READ_HUFF_TABLE: num_bits=%u max_code_length=%u num_leaves=%u\n",
+            num_bits, max_code_length, num_leaves);
+        for (k = 0; k < num_leaves; k++)
+            fprintf(stderr, "PRC_DIAG_READ_HUFF_TABLE:   leaf_value=%u code_length=%u code_value=%u\n",
+                leaf_values[k], code_length[k], code_values[k]);
+    }
+
+    /* Arena-allocate the tree nodes in one block instead of one prc_malloc per
+       node (PERF-3, matches the encode side's node_bank in prc_huff.c). Each of
+       the num_leaves root-to-leaf walks below creates at most one new node per
+       bit of its code_length, plus the root itself, so 1 + sum(code_length[k])
+       is an exact upper bound. The arena is sized once, up front, and never
+       reallocated -- a mid-build realloc could move the block and invalidate
+       already-issued node pointers (root_node, curr_node->left/right). */
+    node_arena_capacity = 1;
+    for (k = 0; k < num_leaves; k++)
+        node_arena_capacity += code_length[k];
+
+    if (node_arena_capacity > SIZE_MAX / sizeof(prc_huff_node))
+    {
+        prc_error(ctx, PRC_ERROR_MEMORY, "Huffman tree node count overflow\n");
+        prc_free(ctx, huffman_array);
+        prc_free(ctx, leaf_values);
+        prc_free(ctx, code_length);
+        prc_free(ctx, code_values);
+        return NULL;
+    }
+
+    node_arena = (prc_huff_node *)prc_calloc(ctx, (size_t)node_arena_capacity, sizeof(prc_huff_node));
+    if (node_arena == NULL)
+    {
+        prc_error(ctx, PRC_ERROR_MEMORY, "Allocation error of huffman node_arena\n");
+        prc_free(ctx, huffman_array);
+        prc_free(ctx, leaf_values);
+        prc_free(ctx, code_length);
+        prc_free(ctx, code_values);
+        return NULL;
+    }
+
+    /* Build the tree.  The idea here is to only construct the path to each leaf */
+    root_node = &node_arena[node_arena_used++];
+
+    for (k = 0; k < num_leaves; k++)
+    {
+        /* Traverse current tree. Adding nodes as need to get to leaf */
+        curr_node = root_node;
+        for (j = code_length[k] - 1; j >= 0; j--)
+        {
+            bit_mask = 1 << j;
+            bit = code_values[k] & bit_mask;
+            if (bit == 0)
+            {
+                /* Go left */
+                if (curr_node->left == NULL)
+                {
+                    if (node_arena_used >= node_arena_capacity)
+                    {
+                        prc_error(ctx, PRC_ERROR_INTERNAL, "Huffman node arena exhausted\n");
+                        prc_free(ctx, huffman_array);
+                        prc_free(ctx, leaf_values);
+                        prc_free(ctx, code_length);
+                        prc_free(ctx, code_values);
+                        prc_free(ctx, node_arena);
+                        return NULL;
+                    }
+                    curr_node->left = &node_arena[node_arena_used++];
+                }
+                curr_node = curr_node->left;
+            }
+            else
+            {
+                /* Go right */
+                if (curr_node->right == NULL)
+                {
+                    if (node_arena_used >= node_arena_capacity)
+                    {
+                        prc_error(ctx, PRC_ERROR_INTERNAL, "Huffman node arena exhausted\n");
+                        prc_free(ctx, huffman_array);
+                        prc_free(ctx, leaf_values);
+                        prc_free(ctx, code_length);
+                        prc_free(ctx, code_values);
+                        prc_free(ctx, node_arena);
+                        return NULL;
+                    }
+                    curr_node->right = &node_arena[node_arena_used++];
+                }
+                curr_node = curr_node->right;
+            }
+        }
+        /* At a leaf */
+        curr_node->is_leaf = 1;
+        curr_node->value = leaf_values[k];
+    }
+
+    /* Now get the number of data values that were encoded */
+    num_values = prc_bitread_huff_data(ctx, &huff_state, 32);
+
+    /* Each decoded value consumes at least one bit; reject a count that could
+       not possibly be backed by the remaining data instead of allocating on
+       an attacker-chosen huge value. */
+    if (huff_state.overrun || (uint64_t)num_values > (uint64_t)max_bits)
+    {
+        prc_error(ctx, PRC_ERROR_PARSE, "huffman num_values is invalid\n");
+        prc_free(ctx, huffman_array);
+        prc_free(ctx, leaf_values);
+        prc_free(ctx, code_length);
+        prc_free(ctx, code_values);
+        prc_free(ctx, node_arena);
+        return NULL;
+    }
+
+    data = prc_calloc(ctx, num_values, elem_size);
+    if (data == NULL)
+    {
+        prc_error(ctx, PRC_ERROR_MEMORY, "Allocation error of huffman data\n");
+        prc_free(ctx, huffman_array);
+        prc_free(ctx, leaf_values);
+        prc_free(ctx, code_length);
+        prc_free(ctx, code_values);
+        prc_free(ctx, node_arena);
+        return NULL;
+    }
+
+    /* And finally the encoded values */
+    index = 0;
+    curr_node = root_node;
+    while (index < num_values)
+    {
+        bit = prc_bitread_huff_bit(ctx, &huff_state);
+        if (bit == 0)
+        {
+            curr_node = curr_node->left;
+        }
+        else
+        {
+            curr_node = curr_node->right;
+        }
+        if (curr_node == NULL || huff_state.overrun)
+        {
+            /* A crafted/incomplete code table can walk into an unbuilt branch,
+               or the substream can run dry before num_values is reached.
+               Fail cleanly instead of dereferencing NULL or spinning. */
+            prc_error(ctx, PRC_ERROR_HUFFMAN, "Invalid huffman code encountered while decoding\n");
+            prc_free(ctx, huffman_array);
+            prc_free(ctx, leaf_values);
+            prc_free(ctx, code_length);
+            prc_free(ctx, code_values);
+            prc_free(ctx, data);
+            prc_free(ctx, node_arena);
+            return NULL;
+        }
+        if (curr_node->is_leaf)
+        {
+            /* elem_size is always 1 (character array) or 4 (uint32_t array,
+               matching prc_huff_node.value's own width) -- a plain narrowing
+               cast for the 1-byte case is exactly what each original copy did
+               for its own output type, so this preserves both byte-for-byte. */
+            if (elem_size == sizeof(uint8_t))
+                ((uint8_t *)data)[index] = (uint8_t)curr_node->value;
+            else
+                ((uint32_t *)data)[index] = curr_node->value;
+            index += 1;
+            curr_node = root_node;
+        }
+    }
+    *data_decode_size = num_values;
+
+    /* Last point at which the producer's stored code table is still live. */
+    prc_huff_dump_table(ctx, prc_diag_getenv("PRC_DIAG_HUFF_DUMP"), num_bits,
+        elem_size, num_leaves, max_code_length, num_values,
+        leaf_values, code_length, code_values, data);
+
+    prc_free(ctx, huffman_array);
+    prc_free(ctx, leaf_values);
+    prc_free(ctx, code_length);
+    prc_free(ctx, code_values);
+    prc_free(ctx, node_arena);
+
+    return data;
+}
+
+static uint32_t*
+prc_huffman_data_decoder(prc_context *ctx, prc_bit_state *state, uint8_t num_bits, uint32_t huffman_array_size, uint32_t *data_decode_size)
+{
+    return (uint32_t *)prc_huffman_decode_core(ctx, state, num_bits, huffman_array_size, sizeof(uint32_t), data_decode_size);
+}
+
+/* 10.6 Inverse of Writecharacterarray. */
+uint8_t*
+prc_bitread_character_array(prc_context *ctx, prc_bit_state *state, uint32_t *data_size,
+    uint8_t num_bits, uint8_t has_comp_bit, uint32_t num_known)
+{
+    uint8_t compressed;
+    uint32_t k;
+    uint8_t*data;
+    uint32_t huffman_array_size;
+    uint32_t array_size;
+
+    /* Get the is_compressed bit. */
+    if (has_comp_bit)
+        compressed = prc_bitread_bit(ctx, state);
+
+    /* Go ahead and read the size. This is the used to decide if the data was compressed or not for the indice array */
+    array_size = prc_bitread_uint32(ctx, state);
+    if (array_size == 0)
+    {
+        *data_size = 0;
+        return NULL;
+    }
+
+    if (!has_comp_bit)
+    {
+        if (num_known <= 3) /* HTML doc has < 3 but <= 3 seems to be uncompressed */
+        {
+            compressed = false;
+            *data_size = array_size;
+        }
+        else
+        {
+            compressed = true;
+            huffman_array_size = array_size;
+        }
+    }
+    else
+    {
+        if (compressed)
+        {
+            huffman_array_size = array_size;
+        }
+        else
+        {
+            *data_size = array_size;
+        }
+    }
+
+    if (compressed)
+    {
+        if (huffman_array_size > 0)
+        {
+            /* Shared with prc_huffman_data_decoder -- see prc_huffman_decode_core. */
+            data = (uint8_t *)prc_huffman_decode_core(ctx, state, num_bits, huffman_array_size, sizeof(uint8_t), data_size);
+            return data;
+        }
+        else
+        {
+            *data_size = 0;  /* I don't think this is an error */
+            //prc_error(ctx, PRC_ERROR_HUFFMAN, "Huffman array size is zero\n");
+            return NULL;
+        }
+    }
+    else
+    {
+        data = (uint8_t*)prc_malloc(ctx, sizeof(uint8_t) * *data_size);
+        if (data == NULL)
+        {
+            prc_error(ctx, PRC_ERROR_MEMORY, "Allocation error of prc_bitread_character_array data\n");
+            return NULL;
+        }
+
+        for (k = 0; k < *data_size; k++)
+        {
+            data[k] = prc_bitread_uint8(ctx, state);
+        }
+        return data;
+    }
+    return NULL;
+}
+
+uint32_t
+prc_bitread_uint_variable_bit(prc_context *ctx, prc_bit_state *state, uint32_t bit_length)
+{
+    uint32_t value = 0;
+    uint32_t k;
+    uint8_t bit;
+
+    /* A width past 32 cannot describe a field whose result is a uint32, so
+       it never came from the file directly -- it came from a caller doing
+       arithmetic on a width it read. The case that bit us is
+       `number_of_bits - 1` in prc_bitread_double_with_variable_bit_number:
+       an unsigned zero wraps to 4294967295 and turns the loop below into
+       four billion iterations, each shifting by an amount that is undefined
+       behaviour anyway. Guarding here rather than only at that one caller
+       because every variable-width read in the parser funnels through this
+       function, and the same wrap is available to any of them.
+
+       Marking the stream overrun rather than only returning zero: a width
+       like this means the cursor is no longer on anything meaningful, and
+       callers that do check overrun should see it. */
+    if (bit_length > 32)
+    {
+        prc_error(ctx, PRC_ERROR_PARSE,
+            "A variable-width field of %u bits cannot be read into a 32-bit value; "
+            "the width was computed, not stored, and has wrapped\n", bit_length);
+        state->overrun = 1;
+        return 0;
+    }
+
+    for (k = 0; k < bit_length; k++)
+    {
+        bit = prc_bitread_bit(ctx, state);
+        if (bit)
+            value += 1 << (bit_length - 1 - k);
+    }
+    return value;
+}
+
+
+int32_t
+prc_bitread_int_variable_bit(prc_context *ctx, prc_bit_state *state, uint32_t bit_length)
+{
+    int32_t value;
+    uint8_t sign;
+
+    sign = prc_bitread_bit(ctx, state);
+    value = (int32_t)prc_bitread_uint_variable_bit(ctx, state, bit_length - 1);
+
+    if (sign)
+        return -value;
+    else
+        return value;
+}
+
+/* Report where a CompressedEntityType was read and what it resolved to, for
+   comparison against another implementation reading the same file.
+
+   The offset is in bits from the start of the section the bit state was
+   initialized over -- for exact geometry, the file structure's decompressed
+   geometry section -- and names the first bit of the type field, before any of
+   it is consumed. Two readers that agree on the offset and disagree on the
+   code have a decode difference; two that disagree on the offset have a
+   desync, and the earlier one is the one to trust. That distinction is not
+   otherwise observable from outside a reader, which is why this exists.
+
+   Gated on PRC_DIAG_CET_OFFSETS, and written to stderr rather than the error
+   stack because the error stack only survives as far as the next successful
+   parse, and most of these reads succeed. */
+static void
+prc_diag_report_entity_type(prc_context *ctx, int64_t cet_start, int is_curve,
+    int resolved_code)
+{
+    if (prc_diag_getenv("PRC_DIAG_CET_OFFSETS") == NULL)
+        return;
+    (void)ctx;
+    fprintf(stderr, "[cet] bit=%lld is_curve=%d code=%d\n",
+        (long long)cet_start, is_curve, resolved_code);
+}
+
+/* A special version for dealin with the ana curves */
+int
+prc_bitread_compressed_entity_type_analoop(prc_context *ctx, prc_bit_state *state,
+    uint32_t *entity_type)
+{
+    uint8_t bit0, bit1, bit2, bit3;
+    uint32_t value;
+    /* Start of the CompressedEntityType, captured before any of its bits are
+       consumed. Only the reporting is gated, not the capture, because by the
+       time the gate could be tested the position has already moved. */
+    int64_t cet_start = state->bit_position;
+
+    /* Read the first two bits */
+    bit0 = prc_bitread_bit(ctx, state);
+    bit1 = prc_bitread_bit(ctx, state);
+
+    if (bit0 == 1 && bit1 == 1)
+    {
+        /* Read the next two bits */
+        bit2 = prc_bitread_bit(ctx, state);
+        bit3 = prc_bitread_bit(ctx, state);
+
+        if (bit2 != 0)
+        {
+            prc_diag_report_entity_type(ctx, cet_start, 1,
+                (int)(12u + ((uint32_t)bit2 << 1) + (uint32_t)bit3));
+            /* Codes 14 and 15. See the matching case in
+               prc_bitread_compressed_entity_type below for why these are
+               reported as a loss of bit alignment rather than as an
+               unimplemented type. Reported here rather than being passed up
+               to the dispatch in prc_parse_extra_geometry.c, because the two
+               escape codes that do have meanings are resolved here too and
+               nothing above this point ever sees a 14 or a 15. */
+            prc_error(ctx, PRC_ERROR_PARSE,
+                "Compressed curve type %u is unassigned in ISO 14739 (the escape range "
+                "12-15 defines only 12 and 13); reading one indicates the bitstream is "
+                "no longer aligned to an entity boundary, not an unimplemented feature\n",
+                12u + ((uint32_t)bit2 << 1) + (uint32_t)bit3);
+            return PRC_ERROR_PARSE;
+        }
+        *entity_type = (bit3 == 0) ? PRC_HCG_Ellipse : PRC_HCG_CompositeCurve;
+        prc_diag_report_entity_type(ctx, cet_start, 1, (int)*entity_type);
+        return 0;
+    }
+    else
+    {
+        value = (bit0 << 1) | bit1;
+        switch (value)
+        {
+        case 0:
+            *entity_type = PRC_HCG_Line;
+            break;
+
+        case 1:
+            *entity_type = PRC_HCG_Circle;
+            break;
+
+        case 2:
+            *entity_type = PRC_HCG_BsplineHermiteCurve;
+            break;
+
+        default:
+            /* Unreachable: value is (bit0 << 1) | bit1 with the 11 case
+               already taken by the escape branch, so it is 0, 1 or 2. Kept so
+               the switch stays total over a two-bit field. */
+            prc_error(ctx, PRC_ERROR_PARSE, "Unknown entity type %d in prc_bit_read_compressed_entity_type\n", value);
+            return PRC_ERROR_PARSE;
+        }
+        prc_diag_report_entity_type(ctx, cet_start, 1, (int)*entity_type);
+        return 0;
+    }
+}
+
+/* This may need to be checked for bit order in the is_curve case */
+int
+prc_bitread_compressed_entity_type(prc_context *ctx, prc_bit_state *state,
+                                    uint8_t *is_curve, uint32_t *entity_type)
+{
+    uint8_t bit0, bit1, bit2, bit3;
+    uint32_t value;
+    /* Position of the start of the CompressedEntityType, before any of its
+       bits are consumed, measured from the start of the section this bit
+       state was initialized over. Captured unconditionally because it must be
+       read before the first prc_bitread_bit call; only the reporting is
+       gated. See prc_diag_report_entity_type below. */
+    int64_t cet_start = state->bit_position;
+
+    *is_curve = prc_bitread_bit(ctx, state);
+
+    if (*is_curve)
+    {
+        /* Read the first two bits */
+        bit0 = prc_bitread_bit(ctx, state);
+        bit1 = prc_bitread_bit(ctx, state);
+
+        if (bit0 == 1 && bit1 == 1)
+        {
+            /* Read the next two bits */
+            bit2 = prc_bitread_bit(ctx, state);
+            bit3 = prc_bitread_bit(ctx, state);
+
+            if (bit2 != 0)
+            {
+                /* The curve-type field is a prefix code: two bits, escaping to
+                   four more when those read 11, which yields codes 12-15. Of
+                   those, 12 is PRC_HCG_Ellipse -- declared "reserved for future
+                   use" in 7.9.21.9.1 "General", with a type code but no defined
+                   structure -- and 13 is PRC_HCG_CompositeCurve, a real type
+                   with a real layout (7.9.21.9.5, Table 239). 14 and 15 are
+                   assigned no meaning anywhere in ISO 14739.
+
+                   So reaching here means the four bits just consumed were not a
+                   curve type at all, and the most probable cause by a wide
+                   margin is that the bit cursor is no longer on an entity
+                   boundary. Saying that, rather than "unknown type", is the
+                   difference between a reader that can resynchronize and one
+                   that carries on emitting garbage: an unimplemented-feature
+                   report invites the caller to skip and continue, and there is
+                   nothing here to skip. Suggested by @datalogics-pgallot on
+                   pdf-issues #806, where it costs nothing and is the only
+                   zero-cost validity check the escape range affords.
+
+                   Note this test is what makes codes 14 and 15 unreachable
+                   from the type dispatch in prc_parse_extra_geometry.c: the
+                   escape is fully resolved here, so a caller only ever sees
+                   one of the four assigned curve types or an error. */
+                prc_error(ctx, PRC_ERROR_PARSE,
+                    "Compressed curve type %u is unassigned in ISO 14739 (the escape range "
+                    "12-15 defines only 12 and 13); reading one indicates the bitstream is "
+                    "no longer aligned to an entity boundary, not an unimplemented feature\n",
+                    12u + ((uint32_t)bit2 << 1) + (uint32_t)bit3);
+                prc_diag_report_entity_type(ctx, cet_start, 1,
+                    (int)(12u + ((uint32_t)bit2 << 1) + (uint32_t)bit3));
+                return PRC_ERROR_PARSE;
+            }
+            *entity_type = (bit3 == 0) ? PRC_HCG_Ellipse : PRC_HCG_CompositeCurve;
+            prc_diag_report_entity_type(ctx, cet_start, 1, (int)*entity_type);
+            return 0;
+        }
+        else
+        {
+            value = (bit0 << 1) | bit1;
+            switch (value)
+            {
+                case 0:
+                    *entity_type = PRC_HCG_Line;
+                    break;
+
+                case 1:
+                    *entity_type = PRC_HCG_Circle;
+                    break;
+
+                case 2:
+                    *entity_type = PRC_HCG_BsplineHermiteCurve;
+                    break;
+
+                default:
+                    /* Unreachable: value is (bit0 << 1) | bit1 with the 11
+                       case already taken by the escape branch, so it is 0, 1
+                       or 2. Kept so the switch stays total over a two-bit
+                       field. */
+                    prc_error(ctx, PRC_ERROR_PARSE, "Unknown entity type %d in prc_bit_read_compressed_entity_type\n", value);
+                    return PRC_ERROR_PARSE;
+
+            }
+            prc_diag_report_entity_type(ctx, cet_start, 1, (int)*entity_type);
+            return 0;
+        }
+    }
+    else
+    {
+        *entity_type = prc_bitread_uint_variable_bit(ctx, state, 4);
+    }
+    prc_diag_report_entity_type(ctx, cet_start, 0, (int)*entity_type);
+    return 0;
+}
+
+/* An odd one. Similar to the variable bit case but the number of bits is stored
+   in the stream. 9.15 in the HTML document  */
+uint32_t
+prc_bitread_number_of_bits_then_unsigned_int(prc_context *ctx, prc_bit_state *state)
+{
+    /* The number of bits is written out with 5 bits itself */
+    uint32_t bit_length = prc_bitread_uint_variable_bit(ctx, state, 5);
+    return prc_bitread_uint_variable_bit(ctx, state, bit_length);
+}
+
+/* Inverse of 10.8 Writecompressedintegerarray */
+uint32_t*
+prc_bitread_compressed_integer_array(prc_context *ctx, prc_bit_state *state, uint32_t *data_size)
+{
+    uint8_t *bit_lengths;
+    uint32_t size;
+    uint32_t k;
+    uint32_t *data;
+
+    /* First get the bit length storages. These could be Huffman encoded */
+    bit_lengths = prc_bitread_character_array(ctx, state, &size, 6, true, 0);
+    if (bit_lengths == NULL)
+        return NULL;
+
+    data = (uint32_t*)prc_calloc(ctx, size, sizeof(uint32_t));
+    if (data == NULL)
+        return NULL;
+
+    /* Now get the integers of variable lengths */
+   // DEBUG_LOG("prc_bitread_compressed_integer_array\n");
+    {
+        uint8_t diag_bitpos = (prc_diag_getenv("PRC_DIAG_POINT_ARRAY_BITPOS") != NULL);
+        for (k = 0; k < size; k++)
+        {
+            /* DIAGNOSTIC (2026-07-24, PRC_DIAG_POINT_ARRAY_BITPOS): dumps the
+               exact bit_position (and its mod-8 byte-alignment phase) where
+               each point_array value's field STARTS, before consuming it --
+               added to check whether byte alignment (not the value/bit-length
+               itself, already micro-analyzed and found clean) explains the
+               fan8/mixed_chains Acrobat blank-tree bug's 22-bit boundary.
+               Zero behavior change when unset. */
+            if (diag_bitpos)
+                fprintf(stderr, "PRC_DIAG_POINT_ARRAY_BITPOS: k=%u bit_position=%lld byte_offset=%lld bit_in_byte=%d bit_length=%u\n",
+                    k, (long long)state->bit_position, (long long)(state->bit_position / 8),
+                    (int)(state->bit_position % 8), bit_lengths[k]);
+            data[k] = prc_bitread_int_variable_bit(ctx, state, bit_lengths[k]);
+            //DEBUG_LOG("data[%d] = %d\n", k, data[k]);
+       //     DEBUG_LOG("%d, ", data[k]); /* MATLAB style */
+        }
+    }
+
+    prc_free(ctx, bit_lengths);
+
+    *data_size = size;
+    return data;
+}
+
+/* Inverse of 10.7 Writeshortarray */
+int32_t*
+prc_bitread_short_array(prc_context *ctx, prc_bit_state *state, uint32_t *data_size, uint8_t has_comp_bit, uint8_t number_of_bits)
+{
+    uint32_t size;
+    uint8_t compressed;
+    int32_t *output;
+
+    /* Get the is_compressed bit. */
+    if (has_comp_bit)
+        compressed = prc_bitread_bit(ctx, state);
+    else
+        compressed = false;
+
+    /* Get the storage size. This could be the size of the Huffman data or the array size */
+    size = prc_bitread_uint32(ctx, state);
+    if (size == 0)
+        return NULL;
+
+    /* Split between Huffman and non-Huffman case */
+    if (compressed)
+    {
+        uint32_t *data;
+        uint32_t j;
+
+        data = prc_huffman_data_decoder(ctx, state, number_of_bits, size, data_size);
+        if (data == NULL || *data_size == 0)
+        {
+            /* Force an error */
+            *data_size = 1;
+            prc_error(ctx, PRC_ERROR_HUFFMAN, "Error in huffman decoder\n");
+            return NULL;
+        }
+
+        output = (int32_t *)prc_calloc(ctx, *data_size, sizeof(int32_t));
+        if (output == NULL)
+        {
+            prc_error(ctx, PRC_ERROR_MEMORY, "Allocation error in prc_bitread_short_array\n");
+            return NULL;
+        }
+
+        memcpy(output, data, sizeof(int32_t) * (*data_size));
+        prc_free(ctx, data);
+    }
+    else
+    {
+        uint32_t j;
+        int32_t temp1, temp2;
+
+        /* Need better error handling here */
+        output = (int32_t *)prc_calloc(ctx, size, sizeof(int32_t));
+        if (output == NULL)
+        {
+            prc_error(ctx, PRC_ERROR_MEMORY, "Allocation error in prc_bitread_short_array\n");
+            return NULL;
+        }
+        *data_size = size;
+
+        for (j = 0; j < size; j++)
+        {
+            temp1 = prc_bitread_uint8(ctx, state);
+            temp2 = prc_bitread_uint8(ctx, state);
+            output[j] = temp1 + (temp2 << 8);
+        }
+    }
+    return output;
+}
+
+/* Inverse of 10.9 Writecompressedindicearray. These are difference encoded */
+int32_t*
+prc_bitread_compressed_indice_array(prc_context *ctx, prc_bit_state *state,
+                                    uint32_t *data_size, uint8_t has_comp_bit,
+                                    uint32_t num_known)
+{
+    char *bit_lengths;
+    uint32_t size;
+    uint32_t k;
+    int32_t *data;
+    int32_t temp;
+    char bit_count;
+
+    /* First get the bit length storages. These could be Huffman encoded.
+       They are difference encoded */
+    /* This is an odd one. It is possible that there were no reference points and the size
+       here is zero. I would suspect we would not do the readings here then. */
+    bit_lengths = (char*) prc_bitread_character_array(ctx, state, &size, 6, has_comp_bit,
+                                                      num_known);
+    *data_size = size;
+    if (bit_lengths == NULL || size == 0)
+        return NULL;
+
+    data = (int32_t*)prc_calloc(ctx, size, sizeof(int32_t));
+    if (data == NULL)
+        return NULL;
+
+    /* This is not clear in the spec bit lengths must be less than 32 which
+       is 1 for the sign bit and 31 for the unsignedinteger.  Make sure we
+       are less than 32. If not, then the encoding is negative??? Looking
+       carefully at this these are always 6 bits.  If they are negative
+       the sixth bit (32) is set.  In that case, or this with 0xC0 to get
+       the proper negative number */
+    for (k = 0; k < size; k++)
+    {
+        if (bit_lengths[k] >= 32)
+        {
+            bit_lengths[k] = bit_lengths[k] | 0xc0;  /* Crazy this is not in the spec */
+        }
+    }
+
+    /* Read in the first variable encoded value */
+    bit_count = bit_lengths[0];
+ //   DEBUG_LOG("\nprc_bitread_compressed_indice_array\n");
+    data[0] = prc_bitread_int_variable_bit(ctx, state, (uint8_t) bit_count);
+ //   DEBUG_LOG("data[0] = %d\n", data[0]);
+
+    /* Now get the rest which are difference encoded integers of variable lengths */
+    for (k = 1; k < size; k++)
+    {
+        bit_count += (int)bit_lengths[k];
+       // bit_count = (int)bit_lengths[k];
+        temp = prc_bitread_int_variable_bit(ctx, state, (uint8_t) bit_count);
+        data[k] = temp + data[k - 1];
+ //       DEBUG_LOG("data[%d] = %d\n", k, data[k]);
+    }
+
+    prc_free(ctx, bit_lengths);
+
+    return data;
+}

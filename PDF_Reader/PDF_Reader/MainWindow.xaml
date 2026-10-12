@@ -71,6 +71,9 @@
                         <MenuItem Header="Найти" Command="{Binding FindCommand}" InputGestureText="Ctrl+F"/>
                     </MenuItem>
                     <MenuItem Header="_Вид">
+                        <MenuItem Header="3D-просмотр текущей страницы…" Click="Open3D_Click"/>
+                        <MenuItem Header="Настройки 3D-графики…" Click="GraphicsSettings_Click"/>
+                        <Separator/>
                         <MenuItem Header="Тема оформления">
                             <MenuItem x:Name="SystemThemeMenu" Header="Как в Windows" Tag="System" Click="Theme_Click"/>
                             <MenuItem x:Name="LightThemeMenu" Header="Светлая" Tag="Light" Click="Theme_Click"/>
@@ -361,11 +364,16 @@
                     <DataTemplate>
                         <StackPanel>
                             <Border Background="White" BorderBrush="{DynamicResource Line}" BorderThickness="1">
+                                <Grid>
                                 <c:PdfPageControl Item="{Binding}" Version="{Binding Version}" Width="{Binding Width}" Height="{Binding Height}"
                                                   Match="{Binding DataContext.SelectedMatch, RelativeSource={RelativeSource AncestorType=Window}}"
                                                   MatchesVersion="{Binding DataContext.MatchesVersion, RelativeSource={RelativeSource AncestorType=Window}}"
                                                   SelectedAnnotation="{Binding DataContext.SelectedAnnotation, RelativeSource={RelativeSource AncestorType=Window}}"
                                                   Workspace="{Binding DataContext, RelativeSource={RelativeSource AncestorType=Window}}"/>
+                                <Button Content="Открыть 3D-просмотр…" Tag="{Binding}" Click="Open3D_Click" HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="12">
+                                    <Button.Style><Style TargetType="Button" BasedOn="{StaticResource AccentButton}"><Setter Property="Visibility" Value="Collapsed"/><Style.Triggers><DataTrigger Binding="{Binding Info.Has3D}" Value="True"><Setter Property="Visibility" Value="Visible"/></DataTrigger></Style.Triggers></Style></Button.Style>
+                                </Button>
+                                </Grid>
                             </Border>
                             <TextBlock Text="{Binding Label}" FontSize="11" Foreground="{DynamicResource Muted}" HorizontalAlignment="Center" Margin="0,10,0,0"/>
                         </StackPanel>

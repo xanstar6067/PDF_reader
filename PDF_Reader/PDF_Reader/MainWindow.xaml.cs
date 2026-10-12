@@ -19,14 +19,31 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer _scrollTimer;
     private readonly DispatcherTimer _autosaveTimer;
     private readonly DialogService _dialogs;
+    private readonly SettingsService _settings;
     public ThemeService Themes { get; }
 
     public WorkspaceViewModel Workspace { get; }
 
     public MainWindow() : this(new SettingsService()) { }
 
+    private void Open3D_Click(object sender, RoutedEventArgs e)
+    {
+        var page = sender is FrameworkElement { Tag: PageItem item } ? item : Workspace.Pages.ElementAtOrDefault(Workspace.CurrentPage - 1);
+        if (page is null || !page.Info.Has3D)
+        {
+            Views.MessageWindow.Show(this, "На текущей странице нет встроенной 3D-модели.", "3D-просмотр");
+            return;
+        }
+        new Views.ThreeDWindow(page, _settings) { Owner = this }.Show();
+    }
+
+    private void GraphicsSettings_Click(object sender, RoutedEventArgs e) => new Views.GraphicsSettingsWindow(_settings) { Owner = this }.ShowDialog();
+
     public MainWindow(SettingsService settings, RecoveryService? recovery = null)
     {
+        _settings = settings;
+        ThreeDService.PreferredGpu = settings.Value.Preferred3DGpu;
+        ThreeDService.PreferredGpuName = settings.Value.Preferred3DGpuName;
         Themes = new ThemeService(settings);
         InitializeComponent();
         SourceInitialized += (_, _) => ThemeService.UpdateTitleBar(this);

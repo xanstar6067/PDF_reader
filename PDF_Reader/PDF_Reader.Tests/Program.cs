@@ -48,8 +48,9 @@ internal static class Program
             TestAnnotations();
             TestAnnotationEditing(output);
             TestRecovery(output);
+            TestThreeD(output, args);
             Console.WriteLine("PASS: markup annotations, crash recovery");
-            TestUi(output);
+            TestUi(output, args);
             Console.WriteLine($"PASS: {_assertions} assertions, native PDFium and WPF integration.");
             return 0;
         }
@@ -64,6 +65,67 @@ internal static class Program
     {
         if (!condition) throw new InvalidOperationException("FAIL: " + name);
         _assertions++;
+    }
+
+    private static void TestThreeD(string output, string[] args)
+    {
+        foreach(var compressed in new[]{false,true})
+        {
+            using var document=PdfDocument.FromBytes(PdfFixture.Create3D(compressed));
+            Check(document.GetPages()[0].Has3D,"generated U3D PDF detected");
+            var decoded=Task.Run(()=>ThreeDService.LoadAsync(document,0)).GetAwaiter().GetResult();
+            Check(decoded.TriangleCount==1 && decoded.Parts[0].Name=="Triangle","independent U3D worker decodes generated triangle");
+            Check(!document.IsDirty,"3D extraction is read only");
+            document.RotatePage(0,1);
+            var rotated=Task.Run(()=>ThreeDService.LoadAsync(document,0)).GetAwaiter().GetResult();
+            Check(rotated.Bounds.Width>rotated.Bounds.Height,"3D annotation coordinates follow PDF page rotation");
+        }
+        // A tiny neutral scene exercises D3D11 without depending on user data or a discrete GPU.
+        float[] vertices = [-.45f,-.4f,0, 0,0,1, 1,0,0,1, .45f,-.4f,0, 0,0,1, 0,1,0,1, 0,.4f,0, 0,0,1, 0,0,1,1];
+        var scene = new ThreeDScene([new("Triangle", vertices)], "test", new Rect(0,0,1,1), false);
+        using (var renderer = new ThreeDRenderer(scene, -1))
+        {
+            Check(renderer.AdapterId == -1, "explicit software adapter");
+            var state = new ThreeDViewState { Pitch = 0, Yaw = 0 };
+            var image = renderer.Render(320, 240, state);
+            var pixels = new byte[320*240*4]; image.CopyPixels(pixels,320*4,0);
+            Check(pixels.Where((p,i) => i%4 == 0).Distinct().Count() > 20, "D3D11 renders interpolated mesh colors");
+            state.Style = ThreeDStyle.Wireframe;
+            var wire = renderer.Render(320,240,state); var wirePixels = new byte[pixels.Length];wire.CopyPixels(wirePixels,320*4,0);
+            Check(!pixels.SequenceEqual(wirePixels), "wireframe changes actual rendering");
+            state.Style = ThreeDStyle.Glossy;state.Section=true;state.SectionPosition=-.1f;
+            var clipped = renderer.Render(320,240,state);var clippedPixels=new byte[pixels.Length];clipped.CopyPixels(clippedPixels,320*4,0);
+            Check(!pixels.SequenceEqual(clippedPixels), "section clipping removes triangles");
+        }
+        var settingsPath = Path.Combine(output,"3d-settings.json");var settings = new SettingsService(settingsPath);settings.Value.Preferred3DGpu=-1;settings.Save();
+        Check(new SettingsService(settingsPath).Value.Preferred3DGpu == -1,"3D GPU preference persists");
+        var hardwareAdapters = ThreeDRenderer.GetAdapters();
+        if (hardwareAdapters.Count > 0)
+        {
+            using var remapped = new ThreeDRenderer(scene, long.MaxValue, hardwareAdapters[0].Name);
+            Check(remapped.AdapterId == hardwareAdapters[0].Id,"GPU preference survives changed DXGI LUID");
+        }
+        var badMesh = Path.Combine(output,"bad.pd3d");File.WriteAllBytes(badMesh,"PD3D0001"u8.ToArray());Throws<EndOfStreamException>(() => ThreeDService.ReadMesh(badMesh,"U3D",new(0,0,1,1)),"truncated worker output rejected");
+        var samplesIndex = Array.IndexOf(args,"--3d-samples");
+        if (samplesIndex >= 0 && samplesIndex + 1 < args.Length)
+        {
+            var samples = Directory.GetFiles(args[samplesIndex+1]).Where(p => p.EndsWith(".pdf",StringComparison.OrdinalIgnoreCase));
+            var index=0;
+            foreach (var sample in samples)
+            {
+                var original=File.ReadAllBytes(sample);using var document=PdfDocument.Open(sample);var pages=document.GetPages();
+                Check(pages.Any(p=>p.Has3D),"3D annotations detected");
+                var page=pages.First(p=>p.Has3D);var model=Task.Run(()=>ThreeDService.LoadAsync(document,page.Index)).GetAwaiter().GetResult();
+                Check(model.TriangleCount>100,"real 3D model decoded");Check(model.Parts.All(p=>p.Vertices.All(float.IsFinite)),"finite model coordinates");
+                using var renderer=new ThreeDRenderer(model);var image=renderer.Render(1000,700,new());
+                var encoder=new PngBitmapEncoder();encoder.Frames.Add(BitmapFrame.Create(image));using(var file=File.Create(Path.Combine(output,$"3d-sample-{++index}.png")))encoder.Save(file);
+                var preview=Task.Run(()=>ThreeDService.PreviewAsync(document,page.Index,600,CancellationToken.None)).GetAwaiter().GetResult();
+                Check(preview.PixelWidth==600,"3D preview preserves page width");
+                Check(!document.IsDirty && original.SequenceEqual(File.ReadAllBytes(sample)),"3D viewing preserves PDF bytes");
+                Console.WriteLine($"3D: {Path.GetFileName(sample)}, {model.Format}, {model.Parts.Count} parts, {model.TriangleCount} triangles, adapter {renderer.AdapterId}");
+            }
+        }
+        Console.WriteLine("PASS: D3D11/WARP, mesh validation, effects, GPU settings, optional real 3D PDFs");
     }
 
     private static void Throws<T>(Action action, string name) where T : Exception
@@ -652,7 +714,7 @@ internal static class Program
         }
     }
 
-    private static void TestUi(string output)
+    private static void TestUi(string output, string[] args)
     {
         Console.WriteLine("WPF: initialize application resources");
         RenderOptions.ProcessRenderMode = System.Windows.Interop.RenderMode.SoftwareOnly;
@@ -680,6 +742,28 @@ internal static class Program
         window.Show();
         Console.WriteLine("WPF: window shown, pumping layout");
         Pump(200);
+        var graphicsDialog = new PDF_Reader.Views.GraphicsSettingsWindow(new SettingsService(Path.Combine(output, "3d-settings.json"))) { Owner = window, ShowActivated = false };
+        graphicsDialog.Show(); Pump(800); SaveWindow(graphicsDialog, Path.Combine(output, "3d-graphics-settings.png"));
+        Check(FindVisuals<System.Windows.Controls.ComboBox>(graphicsDialog).Any(c => c.Items.Count >= 2), "3D GPU settings exposes auto and WARP"); graphicsDialog.Close();
+        var threeDArgument = Array.IndexOf(args,"--3d-samples");
+        if (threeDArgument >= 0 && threeDArgument+1 < args.Length)
+        {
+            var sample = Directory.GetFiles(args[threeDArgument+1]).First(p => p.EndsWith(".pdf",StringComparison.OrdinalIgnoreCase));
+            using var sampleDocument = PdfDocument.Open(sample);var modelPage = sampleDocument.GetPages().First(p=>p.Has3D);
+            var modelViewer = new PDF_Reader.Views.ThreeDWindow(new PageItem(sampleDocument, modelPage, 1), new SettingsService(Path.Combine(output,"3d-ui-settings.json"))) { Owner=window,ShowActivated=false };
+            modelViewer.Show();
+            var deadline=DateTime.UtcNow.AddSeconds(30);
+            while (!FindVisuals<System.Windows.Controls.Image>(modelViewer).Any(i=>i.Source is not null) && DateTime.UtcNow<deadline) Pump(50);
+            Check(FindVisuals<System.Windows.Controls.Image>(modelViewer).Any(i=>i.Source is not null),"interactive 3D window renders model");
+            Check(FindVisuals<System.Windows.Controls.Image>(modelViewer).Any(i=>i.Source is BitmapSource b && b.PixelWidth>300),"3D window renders at viewport resolution");
+            SaveWindow(modelViewer,Path.Combine(output,"3d-modelViewer.png"));
+            var modes=FindVisuals<System.Windows.Controls.ComboBox>(modelViewer).First();modes.SelectedIndex=4;Pump(250);SaveWindow(modelViewer,Path.Combine(output,"3d-wireframe.png"));
+            Check(!sampleDocument.IsDirty,"3D controls do not edit PDF");modelViewer.Close();Pump(100);
+            var printPlan=PrintLayout.Create(sampleDocument.GetPages(),[modelPage.Index],new Size(794,1123),new Rect(20,20,754,1083),new PrintOptions());
+            var printTask=PrintService.RenderPreviewAsync(sampleDocument,printPlan,0,"3D sample",CancellationToken.None);UntilComplete(printTask);
+            var printed=printTask.GetAwaiter().GetResult();SaveImage(printed,Path.Combine(output,"3d-print-preview.png"));
+            Check(Pixels(printed).Distinct().Count()>20,"3D print preview contains rendered model");
+        }
         Console.WriteLine("WPF: layout ready");
         TestThemePanels(window, output);
         SaveWindow(window, Path.Combine(output, "welcome.png"));

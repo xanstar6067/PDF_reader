@@ -16,6 +16,9 @@ public sealed class AppSettings
     public AppTheme Theme { get; set; } = AppTheme.System;
     public double Zoom { get; set; } = 1;
     public PrintScaling PrintScaling { get; set; } = PrintScaling.Fit;
+    /// <summary>0: prefer discrete hardware; -1: WARP; otherwise DXGI adapter LUID.</summary>
+    public long Preferred3DGpu { get; set; }
+    public string? Preferred3DGpuName { get; set; }
 }
 
 public sealed class SettingsService

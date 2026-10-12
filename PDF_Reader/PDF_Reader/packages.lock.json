@@ -7,6 +7,18 @@
         "requested": "[157.0.8086, )",
         "resolved": "157.0.8086",
         "contentHash": "cu9ozLzwk0O329oXcF1XVg8tsc2q4BzavKBzOMnkRWWNlFWjiw8uBZWrt5W5NDlHOy1Yb+uIBPAn7YYJaf+7Yg=="
+      },
+      "Microsoft.NET.ILLink.Tasks": {
+        "type": "Direct",
+        "requested": "[10.0.12, )",
+        "resolved": "10.0.12",
+        "contentHash": "xi+BDjFpW+Sb+MHFHaH6Y/gV9I8BluFwRXc1QyCdoZbIK26eNiBeFuMTe/FMwc33G1wdHCyDg7CVTmb8OdQrMQ=="
+      },
+      "PdfPig": {
+        "type": "Direct",
+        "requested": "[0.1.14, )",
+        "resolved": "0.1.14",
+        "contentHash": "V2Anq0Yvyn3bGGG8WCQxqEAshG0KHIehB0QOotCz14vTkEk1PR3ErPOSmbnEsyOewhdF3G5XpQHywK2L50Xu+A=="
       }
     },
     "net10.0-windows7.0/win-x64": {

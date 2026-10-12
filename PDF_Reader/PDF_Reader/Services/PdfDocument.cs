@@ -127,6 +127,42 @@ public sealed class PdfDocument : IDisposable
         }
     }
 
+    /// <summary>Snapshot for the independent 3D parser; acquired only by background callers.</summary>
+    internal (byte[] Bytes, string? Password, Rect Bounds) ThreeDInput(int index)
+    {
+        lock (Gate)
+        {
+            EnsureOpen();
+            var bounds = OnPage(index, page =>
+            {
+                for (var i = 0; i < Pdfium.FPDFPage_GetAnnotCount(page); i++)
+                {
+                    var annotation = Pdfium.FPDFPage_GetAnnot(page, i);
+                    if (annotation == 0) continue;
+                    try { if (Pdfium.FPDFAnnot_GetSubtype(annotation) == 25 && Pdfium.FPDFAnnot_GetRect(annotation, out var r) != 0) return new Rect(ToDisplay(page, r.Left, r.Top), ToDisplay(page, r.Right, r.Bottom)); }
+                    finally { Pdfium.FPDFPage_CloseAnnot(annotation); }
+                }
+                return new Rect(0, 0, 1, 1);
+            });
+            bounds.Intersect(new Rect(0, 0, 1, 1));
+            return (CurrentBytes(), _password, bounds);
+        }
+    }
+
+    internal bool Contains3D(int index)
+    {
+        lock (Gate) return OnPage(index, page =>
+        {
+            for (var i = 0; i < Pdfium.FPDFPage_GetAnnotCount(page); i++)
+            {
+                var annotation = Pdfium.FPDFPage_GetAnnot(page, i); if (annotation == 0) continue;
+                try { if (Pdfium.FPDFAnnot_GetSubtype(annotation) == 25) return true; }
+                finally { Pdfium.FPDFPage_CloseAnnot(annotation); }
+            }
+            return false;
+        });
+    }
+
     private static void EnsureLibrary()
     {
         if (_initialized) return;
@@ -269,7 +305,18 @@ public sealed class PdfDocument : IDisposable
                     !float.IsFinite(size.Width) || !float.IsFinite(size.Height) || size.Width <= 0 || size.Height <= 0)
                     throw new InvalidDataException($"Некорректный размер страницы {i + 1}.");
                 var label = ReadString((b, n) => Pdfium.FPDF_GetPageLabel(_handle, i, b, n));
-                result.Add(new(i, size.Width, size.Height, string.IsNullOrEmpty(label) ? (i + 1).ToString() : label));
+                var has3D = OnPage(i, pageHandle =>
+                {
+                    for (var a = 0; a < Pdfium.FPDFPage_GetAnnotCount(pageHandle); a++)
+                    {
+                        var annotation = Pdfium.FPDFPage_GetAnnot(pageHandle, a);
+                        if (annotation == 0) continue;
+                        try { if (Pdfium.FPDFAnnot_GetSubtype(annotation) == 25) return true; }
+                        finally { Pdfium.FPDFPage_CloseAnnot(annotation); }
+                    }
+                    return false;
+                });
+                result.Add(new(i, size.Width, size.Height, string.IsNullOrEmpty(label) ? (i + 1).ToString() : label, has3D));
             }
             return result;
         }

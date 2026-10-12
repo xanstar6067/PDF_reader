@@ -20,8 +20,17 @@
   <ItemGroup>
     <Resource Include="Assets/paperdesk.ico" />
     <PackageReference Include="bblanchon.PDFium.Win32" Version="157.0.8086" />
+    <PackageReference Include="PdfPig" Version="0.1.14" />
     <InternalsVisibleTo Include="PDF_Reader.Tests" />
     <Content Include="../../third-party/**/*" Link="third-party/%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <Target Name="BuildPaperDesk3D" BeforeTargets="BeforeBuild">
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)/../../tools/Build-3D.ps1&quot;" />
+  </Target>
+  <ItemGroup>
+    <Content Include="../../artifacts/native3d/bin/Release/PaperDesk3D.dll" Link="PaperDesk3D.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="../../artifacts/native3d/bin/Release/PaperDeskModelWorker.exe" Link="PaperDeskModelWorker.exe" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

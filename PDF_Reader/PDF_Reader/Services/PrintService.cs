@@ -107,7 +107,17 @@ public static class PrintService
             var y = Math.Clamp((int)Math.Floor(visible.Top * sy), 0, fullHeight - 1);
             var right = Math.Clamp((int)Math.Ceiling(visible.Right * sx), x + 1, fullWidth);
             var bottom = Math.Clamp((int)Math.Ceiling(visible.Bottom * sy), y + 1, fullHeight);
-            var image = document.RenderRegion(slot.PageIndex, fullWidth, fullHeight, new Int32Rect(x, y, right - x, bottom - y), cancellation, printing: true);
+            BitmapSource image;
+            if (document.Contains3D(slot.PageIndex))
+            {
+                // The same default 3D view used on the page, cropped to the print slot.
+                var full = ThreeDService.PreviewAsync(document, slot.PageIndex, Math.Min(fullWidth, 2048), cancellation).GetAwaiter().GetResult();
+                var crop = new Int32Rect(Math.Clamp((int)(x * (double)full.PixelWidth / fullWidth),0,full.PixelWidth-1), Math.Clamp((int)(y * (double)full.PixelHeight / fullHeight),0,full.PixelHeight-1),
+                    Math.Max(1,(int)Math.Ceiling((right-x)*(double)full.PixelWidth/fullWidth)),Math.Max(1,(int)Math.Ceiling((bottom-y)*(double)full.PixelHeight/fullHeight)));
+                crop.Width = Math.Min(crop.Width,full.PixelWidth-crop.X);crop.Height = Math.Min(crop.Height,full.PixelHeight-crop.Y);
+                var cropped = new CroppedBitmap(full,crop);cropped.Freeze();image=cropped;
+            }
+            else image = document.RenderRegion(slot.PageIndex, fullWidth, fullHeight, new Int32Rect(x, y, right - x, bottom - y), cancellation, printing: true);
             if (options.Grayscale)
             {
                 var gray = new FormatConvertedBitmap(image, PixelFormats.Gray8, null, 0);
