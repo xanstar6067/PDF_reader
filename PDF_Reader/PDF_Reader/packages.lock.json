@@ -8,12 +8,6 @@
         "resolved": "157.0.8086",
         "contentHash": "cu9ozLzwk0O329oXcF1XVg8tsc2q4BzavKBzOMnkRWWNlFWjiw8uBZWrt5W5NDlHOy1Yb+uIBPAn7YYJaf+7Yg=="
       },
-      "Microsoft.NET.ILLink.Tasks": {
-        "type": "Direct",
-        "requested": "[10.0.12, )",
-        "resolved": "10.0.12",
-        "contentHash": "xi+BDjFpW+Sb+MHFHaH6Y/gV9I8BluFwRXc1QyCdoZbIK26eNiBeFuMTe/FMwc33G1wdHCyDg7CVTmb8OdQrMQ=="
-      },
       "PdfPig": {
         "type": "Direct",
         "requested": "[0.1.14, )",

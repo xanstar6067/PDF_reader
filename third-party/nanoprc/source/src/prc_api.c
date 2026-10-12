@@ -1,4 +1,6 @@
 /* Copyright (C) 2023-2026 CascadiaVoxel LLC
+   Modified for PaperDesk on 2026-10-13: occurrence placement inheritance,
+   geometry-reference mapping, local coordinates and rotated nonuniform scale.
 
     nanoPRC is free software: you can redistribute it and/or modify it under
     the terms of the GNU Affero General Public License as published by the
@@ -654,9 +656,13 @@ prc_api_set_transform(prc_context *ctx, prc_api_transform *location,
         {
             if (other_flags_set)
             {
-                matrix[0] = matrix[0] * prc_trans->cartesian.non_uniform_scale.x;
-                matrix[5] = matrix[5] * prc_trans->cartesian.non_uniform_scale.y;
-                matrix[10] = matrix[10] * prc_trans->cartesian.non_uniform_scale.z;
+                /* Scale complete basis columns, including rotated axes. */
+                for (int row = 0; row < 3; row++)
+                {
+                    matrix[row] *= prc_trans->cartesian.non_uniform_scale.x;
+                    matrix[4 + row] *= prc_trans->cartesian.non_uniform_scale.y;
+                    matrix[8 + row] *= prc_trans->cartesian.non_uniform_scale.z;
+                }
             }
             else
             {
@@ -1581,6 +1587,35 @@ PRC_EXPORT prc_api_tess*
 prc_api_get_model_tessellation(prc_context *ctx, prc_api_product* product)
 {
     return product->part->tess;
+}
+
+PRC_EXPORT int
+prc_api_part_local_transform(prc_context *ctx, prc_api_data opaque,
+    const prc_api_part *part, prc_api_transform *transform)
+{
+    prc_data *data = (prc_data *)opaque;
+    uint32_t index, depth = 0;
+    prc_file_struct_internal_global_data *globals;
+    if (!data || !part || !transform) return PRC_API_ERROR_PARAMETER;
+    prc_api_set_transform_to_identity(ctx, transform);
+    index = part->biased_local_coordinate_index;
+    if (!index) return 0;
+    if (part->tess_file_index >= data->file_structure_count ||
+        !data->file_struct[part->tess_file_index].globals) return PRC_API_ERROR_PARSER;
+    globals = &data->file_struct[part->tess_file_index].globals->global_data;
+    if (!globals->ref_coords) return PRC_API_ERROR_PARSER;
+    while (index)
+    {
+        prc_api_transform parent;
+        prc_ri_coordinate_system *coordinate;
+        if (++depth > 256 || index > globals->ref_coord_count) return PRC_API_ERROR_PARSER;
+        coordinate = &globals->ref_coords[index - 1];
+        if (prc_api_set_transform(ctx, &parent, &coordinate->transform) < 0) return PRC_API_ERROR_PARSER;
+        prc_api_update_transform(ctx, &parent, transform);
+        *transform = parent;
+        index = coordinate->item_content.biased_index_local_coordinate_system;
+    }
+    return 0;
 }
 
 PRC_EXPORT prc_api_tess*
@@ -2847,7 +2882,8 @@ cleanup:
 }
 
 
-/* Incoming matrix has all the prototype transforms concatenated */
+/* PaperDesk: incoming matrix contains the first specified (possibly inherited)
+   local placement of this occurrence, not the sum of prototype placements. */
 static int
 prc_api_helper_copy_product_details(prc_context *ctx, prc_api_data data,
     int32_t file_index, char *base_name, prc_api_transform incoming_matrix,
@@ -2890,13 +2926,8 @@ prc_api_helper_copy_product_details(prc_context *ctx, prc_api_data data,
 #endif
 
     memcpy(&product_tree->location, &incoming_matrix, sizeof(prc_api_transform));
-    /* FIXED 2026-08-12: same missing-location_set bug as prc_api_initialize_
-       node above -- incoming_matrix here is the FULLY prototype-chain-
-       composed transform (see this function's own "Incoming matrix has all
-       the prototype transforms concatenated" comment), so this is actually
-       the more complete of the two tree-building paths' transform data --
-       but with location_set never flagged, no consumer (demos/json_export,
-       demos/stl_export) ever knew real data was sitting right here. */
+    /* Publish the resolved local placement for consumers composing real
+       parent/child hierarchy levels. Identity requires no multiplication. */
     product_tree->location_set = !incoming_matrix.is_identity;
     product_tree->is_model = 0;
     product_tree->type = PRC_API_NODE_PRODUCT;
@@ -3286,6 +3317,10 @@ prc_api_helper_add_product(prc_context *ctx, prc_api_data data, uint32_t num_fil
         uint32_t work_parent_biased_style_file_index = item.parent_biased_style_file_index;
         prc_api_product *work_product_tree = item.product_tree;
         prc_api_object_style *work_parent_style = item.parent_style;
+        /* PaperDesk: prototype locations are inherited defaults, not additional
+           parent transforms. Even an explicit identity on the occurrence
+           overrides its prototype's placement (HOOPS GetLocation semantics). */
+        uint8_t location_resolved = 0;
 
         for (;;)
         {
@@ -3358,9 +3393,10 @@ prc_api_helper_add_product(prc_context *ctx, prc_api_data data, uint32_t num_fil
                 goto cleanup;
             }
 
-            /* There is a prototypes to this product. Continue to drill but concatenate
-               any transform as we go. */
-            if (work_product->has_transform)
+            /* Resolve the first specified location along the prototype chain.
+               Child occurrences remain real hierarchy levels and are composed
+               by the consumer; a prototype is the same logical occurrence. */
+            if (work_product->has_transform && !location_resolved)
             {
                 code = prc_api_set_transform(ctx, &new_transform, &work_product->location);
                 if (code < 0)
@@ -3370,6 +3406,7 @@ prc_api_helper_add_product(prc_context *ctx, prc_api_data data, uint32_t num_fil
                     goto cleanup;
                 }
                 prc_api_update_transform(ctx, &work_incoming_transform, &new_transform);
+                location_resolved = 1;
             }
 
             /* !(wants_cross_file_ref && biased_file_index == 0): don't follow
@@ -4064,6 +4101,10 @@ prc_api_get_number_tessellations(prc_context *ctx, prc_api_data data_in,
                         part_detail->has_entity_ref = 0;
                     }
 
+                    /* PaperDesk: the first occurrence needs the same global
+                       mapping as subsequent shared occurrences. Local tess
+                       indices are scoped to a file structure, not the model. */
+                    part->part_detail_index = num_part_tessellations;
                     num_part_tessellations++;
 
                     /* Grab that tessellation and have a look to see if it has

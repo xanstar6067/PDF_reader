@@ -117,6 +117,8 @@ internal static class Program
                 Check(pages.Any(p=>p.Has3D),"3D annotations detected");
                 var page=pages.First(p=>p.Has3D);var model=Task.Run(()=>ThreeDService.LoadAsync(document,page.Index)).GetAwaiter().GetResult();
                 Check(model.TriangleCount>100,"real 3D model decoded");Check(model.Parts.All(p=>p.Vertices.All(float.IsFinite)),"finite model coordinates");
+                if (Path.GetFileName(sample) is "ЛБП в сборе.PDF" or "ЛБП разнесенные детали.PDF")
+                    Check(!model.ApproximatePlacement && model.Notice is null,"SolidWorks 2018 PRC assembly placement fully resolved");
                 using var renderer=new ThreeDRenderer(model);var image=renderer.Render(1000,700,new());
                 var encoder=new PngBitmapEncoder();encoder.Frames.Add(BitmapFrame.Create(image));using(var file=File.Create(Path.Combine(output,$"3d-sample-{++index}.png")))encoder.Save(file);
                 var preview=Task.Run(()=>ThreeDService.PreviewAsync(document,page.Index,600,CancellationToken.None)).GetAwaiter().GetResult();

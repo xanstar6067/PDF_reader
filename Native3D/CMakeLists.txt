@@ -17,6 +17,8 @@ target_compile_definitions(prc PRIVATE PRC_LITTLE_ENDIAN PRC_VERSION_STRING="Pap
 target_link_libraries(prc PRIVATE zlib)
 add_executable(PaperDeskModelWorker "../third-party/nanoprc/paperdesk-worker.cpp")
 target_link_libraries(PaperDeskModelWorker PRIVATE prc zlib)
+add_executable(PaperDeskPrcTests EXCLUDE_FROM_ALL "../third-party/nanoprc/paperdesk-prc-tests.c")
+target_link_libraries(PaperDeskPrcTests PRIVATE prc zlib)
 add_library(PaperDesk3D SHARED Renderer.cpp)
 target_compile_definitions(PaperDesk3D PRIVATE UNICODE _UNICODE NOMINMAX)
 target_link_libraries(PaperDesk3D PRIVATE d3d11 dxgi d3dcompiler)

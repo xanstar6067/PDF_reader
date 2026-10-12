@@ -1,4 +1,5 @@
 /* Copyright (C) 2023-2026 CascadiaVoxel LLC
+   Modified for PaperDesk on 2026-10-13: local coordinate resolution API.
 
     nanoPRC is free software: you can redistribute it and/or modify it under
     the terms of the GNU Affero General Public License as published by the
@@ -491,6 +492,11 @@ PRC_EXPORT void prc_api_update_transform(prc_context *ctx, prc_api_transform *co
  * @param out Output point, in[3] transformed by transform.
  */
 PRC_EXPORT void prc_api_transform_point(const prc_api_transform *transform, const double in[3], double out[3]);
+
+/** PaperDesk extension: resolve an RI's referenced local coordinate system,
+ * including parent coordinate systems. Returns zero or a parser error. */
+PRC_EXPORT int prc_api_part_local_transform(prc_context *ctx, prc_api_data data,
+    const prc_api_part *part, prc_api_transform *transform);
 
 /**
  * @brief Get tessellation pointer for a part representation item.

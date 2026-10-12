@@ -14,3 +14,5 @@ target_compile_definitions(prc PRIVATE PRC_LITTLE_ENDIAN PRC_VERSION_STRING="Pap
 target_link_libraries(prc PRIVATE zlib)
 add_executable(PaperDeskModelWorker paperdesk-worker.cpp)
 target_link_libraries(PaperDeskModelWorker PRIVATE prc zlib)
+add_executable(PaperDeskPrcTests EXCLUDE_FROM_ALL paperdesk-prc-tests.c)
+target_link_libraries(PaperDeskPrcTests PRIVATE prc zlib)

@@ -15,7 +15,7 @@ public sealed record ThreeDPart(string Name, float[] Vertices)
 public sealed record ThreeDScene(IReadOnlyList<ThreeDPart> Parts, string Format, Rect Bounds, bool ApproximatePlacement)
 {
     public int TriangleCount => Parts.Sum(p => p.VertexCount) / 3;
-    public string? Notice => ApproximatePlacement ? "PRC: показаны исходные координаты геометрии. Расположение деталей сборки может отличаться от Acrobat." : null;
+    public string? Notice => ApproximatePlacement ? "Для некоторых деталей PRC не удалось определить положение в сборке. Эти детали показаны в собственных координатах." : null;
 }
 public sealed class ThreeDViewState
 {
