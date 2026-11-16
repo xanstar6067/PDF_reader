@@ -16,7 +16,7 @@ internal sealed class ModelWorkerJob : SafeHandleZeroOrMinusOneIsInvalid
     [DllImport("kernel32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool SetInformationJobObject(nint job, int type, ref Limits limits, uint size);
     [DllImport("kernel32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool AssignProcessToJobObject(nint job, nint process);
     [DllImport("kernel32.dll")] [return: MarshalAs(UnmanagedType.Bool)] private static extern bool CloseHandle(nint handle);
-    public ModelWorkerJob(Process process) : base(true)
+    public ModelWorkerJob(Process process, string operation = "декодера 3D") : base(true)
     {
         SetHandle(CreateJobObject(0, null));
         var limits = new Limits { Basic = new BasicLimits { Flags = 0x2000 | 0x100 | 0x8, ActiveProcesses = 1 }, ProcessMemory = (nuint)(2UL * 1024 * 1024 * 1024) };
@@ -24,7 +24,7 @@ internal sealed class ModelWorkerJob : SafeHandleZeroOrMinusOneIsInvalid
         {
             if (process.HasExited) { Dispose(); return; }
             Dispose(); if (!process.HasExited) process.Kill(entireProcessTree: true);
-            throw new InvalidOperationException("Не удалось ограничить ресурсы декодера 3D.");
+            throw new InvalidOperationException("Не удалось ограничить ресурсы " + operation + ".");
         }
     }
     protected override bool ReleaseHandle() => CloseHandle(handle);

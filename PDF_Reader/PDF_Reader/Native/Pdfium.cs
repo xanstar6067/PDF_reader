@@ -101,6 +101,9 @@ internal static class Pdfium
     [DllImport(Dll)] internal static extern nint FPDFText_LoadFont(nint document, byte[] data, uint size, int type, int cid);
     [DllImport(Dll)] internal static extern void FPDFFont_Close(nint font);
     [DllImport(Dll)] internal static extern int FPDF_ImportPages(nint document, nint source, [MarshalAs(UnmanagedType.LPUTF8Str)] string? range, int index);
+    [DllImport(Dll)] internal static extern nint FPDF_NewXObjectFromPage(nint destination, nint source, int index);
+    [DllImport(Dll)] internal static extern nint FPDF_NewFormObjectFromXObject(nint xobject);
+    [DllImport(Dll)] internal static extern void FPDF_CloseXObject(nint xobject);
 
     [DllImport(Dll)] internal static extern nint FPDFPage_CreateAnnot(nint page, int type);
     [DllImport(Dll)] internal static extern int FPDFPage_GetAnnotCount(nint page);

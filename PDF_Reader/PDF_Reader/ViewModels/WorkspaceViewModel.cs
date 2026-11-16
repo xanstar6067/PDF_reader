@@ -601,6 +601,24 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
         if (!string.IsNullOrWhiteSpace(Query)) QueueSearch();
     }
 
+    public async Task<OcrSummary> RecognizeAsync(int[] pages, OcrOptions options, IProgress<OcrProgress> progress, CancellationToken cancellation)
+    {
+        if (!CanInteract || Document is not { } document) throw new InvalidOperationException("Документ занят.");
+        CancelSearch();
+        OcrSummary? result = null;
+        await BusyAsync("Распознавание текста…", async () =>
+        {
+            try { result = await Task.Run(() => OcrService.RecognizeAsync(document, pages, options, progress, cancellation), cancellation); }
+            finally
+            {
+                // Each completed page is a transaction. Refresh even after cancellation or a later page's failure.
+                await RefreshAsync(pages.Length == 1 ? pages[0] : null);
+            }
+        });
+        if (!string.IsNullOrWhiteSpace(Query)) QueueSearch();
+        return result!;
+    }
+
     private async Task MovePageAsync(int direction)
     {
         var from = CurrentPage - 1;

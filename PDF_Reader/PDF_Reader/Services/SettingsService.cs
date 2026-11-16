@@ -19,6 +19,7 @@ public sealed class AppSettings
     /// <summary>0: prefer discrete hardware; -1: WARP; otherwise DXGI adapter LUID.</summary>
     public long Preferred3DGpu { get; set; }
     public string? Preferred3DGpuName { get; set; }
+    public OcrOptions Ocr { get; set; } = new();
 }
 
 public sealed class SettingsService
@@ -42,6 +43,9 @@ public sealed class SettingsService
         if (!Enum.IsDefined(Value.Theme)) Value.Theme = AppTheme.System;
         if (!double.IsFinite(Value.Zoom) || Value.Zoom < .25 || Value.Zoom > 4) Value.Zoom = 1;
         if (!Enum.IsDefined(Value.PrintScaling)) Value.PrintScaling = PrintScaling.Fit;
+        Value.Ocr ??= new();
+        try { Value.Ocr.Validate(); }
+        catch (ArgumentException) { Value.Ocr = new(); }
     }
 
     /// <summary>Records a recent document and writes settings immediately, so a crash does not lose the list.</summary>

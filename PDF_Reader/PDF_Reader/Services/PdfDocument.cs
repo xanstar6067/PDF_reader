@@ -365,16 +365,17 @@ public sealed class PdfDocument : IDisposable
         }
     }
 
-    private BitmapSource RenderBitmap(nint page, int pageWidth, int pageHeight, Int32Rect region, bool printing, CancellationToken cancellation)
+    private BitmapSource RenderBitmap(nint page, int pageWidth, int pageHeight, Int32Rect region, bool printing, CancellationToken cancellation, bool contentOnly = false)
     {
         var bitmap = Pdfium.FPDFBitmap_Create(region.Width, region.Height, 1);
         if (bitmap == 0) throw new InvalidOperationException("Не удалось выделить память для страницы.");
         try
         {
             var flags = printing ? 0x801 : 0x3;
+            if (contentOnly) flags &= ~1;
             Pdfium.FPDFBitmap_FillRect(bitmap, 0, 0, region.Width, region.Height, 0xffffffff);
             Pdfium.FPDF_RenderPageBitmap(bitmap, page, -region.X, -region.Y, pageWidth, pageHeight, 0, flags);
-            if (_forms is not null) Pdfium.FPDF_FFLDraw(_forms.Handle, bitmap, page, -region.X, -region.Y, pageWidth, pageHeight, 0, flags);
+            if (_forms is not null && !contentOnly) Pdfium.FPDF_FFLDraw(_forms.Handle, bitmap, page, -region.X, -region.Y, pageWidth, pageHeight, 0, flags);
             var stride = Pdfium.FPDFBitmap_GetStride(bitmap);
             var image = BitmapSource.Create(region.Width, region.Height, 96, 96, PixelFormats.Bgra32, null,
                 Pdfium.FPDFBitmap_GetBuffer(bitmap), checked(stride * region.Height), stride);
@@ -427,6 +428,64 @@ public sealed class PdfDocument : IDisposable
         {
             RequirePermission(16, "Копирование текста запрещено владельцем PDF.");
             return OnPage(index, p => OnText(p, t => GetText(t, 0, Pdfium.FPDFText_CountChars(t))));
+        }
+    }
+
+    internal sealed record OcrInput(long Revision, BitmapSource Image);
+
+    internal OcrInput? PrepareOcrPage(int index, int dpi, CancellationToken cancellation)
+    {
+        lock (Gate)
+        {
+            RequirePermission(8 | 16, "Для OCR требуются разрешения на изменение и копирование текста PDF.");
+            cancellation.ThrowIfCancellationRequested();
+            return OnPage(index, page =>
+            {
+                if (OnText(page, t => !string.IsNullOrWhiteSpace(GetText(t, 0, Pdfium.FPDFText_CountChars(t))))) return null;
+                var width = Pdfium.FPDF_GetPageWidthF(page); var height = Pdfium.FPDF_GetPageHeightF(page);
+                var requested = (int)Math.Clamp(Math.Ceiling(width * dpi / 72), 16, MaxRenderSide);
+                var size = FitRenderSize(width, height, requested);
+                return new OcrInput(Revision, RenderBitmap(page, size.Width, size.Height, new Int32Rect(0, 0, size.Width, size.Height), false, cancellation, contentOnly: true));
+            });
+        }
+    }
+
+    internal void AddOcrLayer(int index, long expectedRevision, byte[] textPdf)
+    {
+        lock (Gate)
+        {
+            RequirePermission(8 | 16, "Для OCR требуются разрешения на изменение и копирование текста PDF.");
+            if (Revision != expectedRevision) throw new InvalidOperationException("Документ изменился во время распознавания. Запустите OCR ещё раз.");
+            using var source = FromBytes(textPdf);
+            if (source.PageCount != 1 || string.IsNullOrWhiteSpace(source.ExtractText(0))) throw new InvalidDataException("В результате OCR нет текстового слоя.");
+            Edit(() => OnPage(index, page =>
+            {
+                if (OnText(page, t => !string.IsNullOrWhiteSpace(GetText(t, 0, Pdfium.FPDFText_CountChars(t)))))
+                    throw new InvalidOperationException("На странице уже есть текстовый слой.");
+                var size = source.GetPages()[0];
+                var origin = ToPdf(page, new Point(0, 1));
+                var right = ToPdf(page, new Point(1, 1));
+                var top = ToPdf(page, new Point(0, 0));
+                var template = Pdfium.FPDF_NewXObjectFromPage(_handle, source._handle, 0);
+                if (template == 0) throw new InvalidOperationException("Не удалось перенести текстовый слой OCR.");
+                nint obj;
+                try { obj = Pdfium.FPDF_NewFormObjectFromXObject(template); }
+                finally { Pdfium.FPDF_CloseXObject(template); }
+                if (obj == 0) throw new InvalidOperationException("Не удалось создать объект OCR.");
+                var matrix = new Pdfium.Matrix
+                {
+                    A = (float)((right.X - origin.X) / size.Width), B = (float)((right.Y - origin.Y) / size.Width),
+                    C = (float)((top.X - origin.X) / size.Height), D = (float)((top.Y - origin.Y) / size.Height),
+                    E = (float)origin.X, F = (float)origin.Y
+                };
+                if (Pdfium.FPDFPageObj_SetMatrix(obj, ref matrix) == 0 || Pdfium.FPDFPage_InsertObject(page, obj) == 0)
+                {
+                    Pdfium.FPDFPageObj_Destroy(obj);
+                    throw new InvalidOperationException("Не удалось разместить текстовый слой OCR.");
+                }
+                Generate(page);
+                return true;
+            }));
         }
     }
 
@@ -622,7 +681,7 @@ public sealed class PdfDocument : IDisposable
     private void RequirePermission(uint bit, string message)
     {
         EnsureOpen();
-        if ((GetPermissions() & bit) == 0) throw new UnauthorizedAccessException(message);
+        if ((GetPermissions() & bit) != bit) throw new UnauthorizedAccessException(message);
     }
 
     private uint GetPermissions()

@@ -12,6 +12,11 @@ public partial class App : Application
     protected override void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
+        if (e.Args is ["--ocr-worker", var directory])
+        {
+            Shutdown(OcrWorker.Run(directory));
+            return;
+        }
         _instance = SingleInstanceService.Start(e.Args);
         if (_instance is null)
         {

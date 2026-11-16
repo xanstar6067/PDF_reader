@@ -85,6 +85,9 @@
                         <MenuItem Header="Полноэкранный режим" Click="FullScreen_Click" InputGestureText="F11"/>
                     </MenuItem>
                     <MenuItem Header="_Документ">
+                        <MenuItem Header="Распознать текст (OCR)…" Click="Ocr_Click" IsEnabled="{Binding CanInteract}"/>
+                        <MenuItem Header="Настройки OCR и языки…" Click="OcrSettings_Click" IsEnabled="{Binding IsBusy, Converter={StaticResource Not}}"/>
+                        <Separator/>
                         <MenuItem Header="Повернуть страницу" Command="{Binding RotateCommand}"/>
                         <MenuItem Header="Добавить страницу" Command="{Binding InsertPageCommand}"/>
                         <MenuItem Header="Вставить из PDF…" Command="{Binding ImportCommand}"/>

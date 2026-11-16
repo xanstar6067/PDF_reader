@@ -39,6 +39,19 @@ public partial class MainWindow : Window
 
     private void GraphicsSettings_Click(object sender, RoutedEventArgs e) => new Views.GraphicsSettingsWindow(_settings) { Owner = this }.ShowDialog();
 
+    private void OcrSettings_Click(object sender, RoutedEventArgs e) => new Views.OcrSettingsWindow(_settings) { Owner = this }.ShowDialog();
+
+    private void Ocr_Click(object sender, RoutedEventArgs e)
+    {
+        if (!Workspace.CanInteract) return;
+        if (Workspace.Info is not { CanEdit: true, CanCopy: true })
+        {
+            Views.MessageWindow.Show(this, "Для OCR требуются разрешения на изменение и копирование текста PDF.", "Распознавание текста");
+            return;
+        }
+        new Views.OcrWindow(Workspace, _settings) { Owner = this }.ShowDialog();
+    }
+
     public MainWindow(SettingsService settings, RecoveryService? recovery = null)
     {
         _settings = settings;

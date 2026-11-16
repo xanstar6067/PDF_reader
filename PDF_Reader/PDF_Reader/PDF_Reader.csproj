@@ -21,9 +21,26 @@
     <Resource Include="Assets/paperdesk.ico" />
     <PackageReference Include="bblanchon.PDFium.Win32" Version="157.0.8086" />
     <PackageReference Include="PdfPig" Version="0.1.14" />
+    <PackageReference Include="Tesseract" Version="5.2.0" />
     <InternalsVisibleTo Include="PDF_Reader.Tests" />
-    <Content Include="../../third-party/**/*" Link="third-party/%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="../../third-party/**/*" Exclude="../../third-party/tesseract/tessdata/*" Link="third-party/%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="../../third-party/tesseract/tessdata/*" Link="tessdata/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <Target Name="VerifyBundledOcrData" BeforeTargets="BeforeBuild">
+    <ItemGroup>
+      <_OcrData Include="../../third-party/tesseract/tessdata/eng.traineddata" ExpectedHash="7D4322BD2A7749724879683FC3912CB542F19906C83BCC1A52132556427170B2" />
+      <_OcrData Include="../../third-party/tesseract/tessdata/rus.traineddata" ExpectedHash="E16E5E036CCE1D9EC2B00063CF8B54472625B9E14D893A169E2B0DEDEB4DF225" />
+      <_OcrData Include="../../third-party/tesseract/tessdata/pdf.ttf" ExpectedHash="C7845420925A23D88ED830A63957B8AF85A66A8DAF8D9FC90E843673B2EF1A59" />
+    </ItemGroup>
+    <GetFileHash Files="@(_OcrData)" Algorithm="SHA256">
+      <Output TaskParameter="Items" ItemName="_OcrHashed" />
+    </GetFileHash>
+    <Error Condition="'%(_OcrHashed.FileHash)' != '%(_OcrHashed.ExpectedHash)'" Text="Bundled OCR resource changed: %(_OcrHashed.Identity). Check the pinned source and SHA256." />
+  </Target>
 
   <Target Name="BuildPaperDesk3D" BeforeTargets="BeforeBuild">
     <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)/../../tools/Build-3D.ps1&quot;" />

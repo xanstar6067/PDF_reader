@@ -28,6 +28,9 @@ internal static class Program
             Directory.CreateDirectory(output);
             ErrorLog.Path = Path.Combine(output, "errors.log");
 
+            TestOcr(output);
+            if (args.Contains("--ocr-only")) return 0;
+
             TestDocument(output);
             Console.WriteLine("PASS: editing, search, outlines, annotations, pages");
             TestHistory(output);
@@ -65,6 +68,71 @@ internal static class Program
     {
         if (!condition) throw new InvalidOperationException("FAIL: " + name);
         _assertions++;
+    }
+
+    private static void TestOcr(string output)
+    {
+        Check(OcrService.Languages().Contains("eng") && OcrService.Languages().Contains("rus"), "Russian and English OCR models bundled");
+        var settingsPath = Path.Combine(output, "ocr-settings.json");
+        var settings = new SettingsService(settingsPath); settings.Value.Ocr = new() { Languages = ["eng"], Dpi = 400, PageSegmentation = 6, UseDictionaries = false, PreserveSpaces = true }; settings.Save();
+        var loaded = new SettingsService(settingsPath).Value.Ocr;
+        Check(loaded.Languages.SequenceEqual(new[] { "eng" }) && loaded.Dpi == 400 && loaded.PageSegmentation == 6 && !loaded.UseDictionaries && loaded.PreserveSpaces, "OCR settings persist");
+        File.WriteAllText(settingsPath, "{\"Ocr\":{\"Languages\":[\"../bad\"],\"Dpi\":-1}}");
+        Check(new SettingsService(settingsPath).Value.Ocr.Languages.SequenceEqual(new[] { "rus", "eng" }), "invalid stored OCR settings reset safely");
+        Throws<ArgumentException>(() => new OcrOptions { Languages = ["eng+rus"] }.Validate(), "invalid OCR language codes rejected");
+        using (var protectedDoc = PdfDocument.FromBytes(PdfFixture.Create(encrypted: true, permissions: -20), "reader-secret"))
+            Throws<UnauthorizedAccessException>(() => protectedDoc.PrepareOcrPage(0, 200, default), "OCR respects PDF copy restrictions even when editing is allowed");
+
+        using var hidden = PdfDocument.FromBytes(PdfFixture.CreateOcrLayer());
+        var sourceBounds = hidden.Search("Hidden", false, false, default).Single().Rectangles[0];
+        for (var rotation = 0; rotation < 4; rotation++)
+        {
+            using var target = PdfDocument.Create();
+            if (rotation > 0) target.RotatePage(0, rotation);
+            var before = target.Render(0, 400); var revision = target.Revision;
+            target.AddOcrLayer(0, revision, hidden.GetBytes());
+            Check(SameImage(before, target.Render(0, 400)), "OCR overlay is invisible at rotation " + rotation);
+            var match = target.Search("Hidden", false, false, default).Single(); var center = Center(match.Rectangles[0]);
+            Check((center - Center(sourceBounds)).Length < .002, "OCR coordinates follow display rotation " + rotation);
+            var bounds = match.Rectangles[0];
+            var selection = target.SelectText(0, new Point(bounds.Left + .001, center.Y), new Point(bounds.Right - .001, center.Y));
+            Check(selection.Text.Contains("Hidden"), "OCR text can be selected at rotation " + rotation);
+            Throws<InvalidOperationException>(() => target.AddOcrLayer(0, revision, hidden.GetBytes()), "stale OCR result rejected");
+        }
+        using var original = PdfDocument.Create();
+        original.AddText(0, new(.1, .15), "Проверка документа", 24);
+        original.AddText(0, new(.1, .25), "PaperDesk document test", 24);
+        var scanBytes = PdfFixture.CreateScan(original.Render(0, 1654));
+        File.WriteAllBytes(Path.Combine(output, "ocr-scan.pdf"), scanBytes);
+        using var scan = PdfDocument.FromBytes(scanBytes); var baseline = scan.Render(0, 600);
+        Check(string.IsNullOrWhiteSpace(scan.ExtractText(0)), "generated scan contains no text layer");
+        var options = new OcrOptions { Dpi = 200, PageSegmentation = 6 };
+        var summary = Task.Run(() => OcrService.RecognizeAsync(scan, new[] { 0 }, options)).GetAwaiter().GetResult();
+        var text = scan.ExtractText(0); Console.WriteLine("OCR: " + text.Replace('\n', ' '));
+        Check(summary.Recognized == 1 && text.Contains("Проверка") && text.Contains("PaperDesk"), "Tesseract recognizes mixed Russian and English scan");
+        Check(SameImage(baseline, scan.Render(0, 600)), "OCR leaves original raster unchanged");
+        var repeat = Task.Run(() => OcrService.RecognizeAsync(scan, new[] { 0 }, options)).GetAwaiter().GetResult();
+        Check(repeat.Skipped == 1 && repeat.Recognized == 0, "existing text layer is skipped");
+        scan.Save(Path.Combine(output, "ocr-searchable.pdf"));
+        using (var reopened = PdfDocument.Open(Path.Combine(output, "ocr-searchable.pdf")))
+            Check(reopened.ExtractText(0).Contains("Проверка") && reopened.Search("PaperDesk", false, false, default).Count == 1, "OCR Unicode and search survive reopening");
+        scan.Undo(); Check(string.IsNullOrWhiteSpace(scan.ExtractText(0)), "OCR layer can be undone");
+        scan.Redo(); Check(scan.ExtractText(0).Contains("Проверка"), "OCR layer can be redone");
+        using var cancelled = PdfDocument.FromBytes(scanBytes); using var cancellation = new CancellationTokenSource(); cancellation.Cancel();
+        Throws<OperationCanceledException>(() => Task.Run(() => OcrService.RecognizeAsync(cancelled, new[] { 0 }, options, cancellation: cancellation.Token)).GetAwaiter().GetResult(), "OCR cancellation leaves document untouched");
+        Check(!cancelled.IsDirty, "cancelled OCR does not modify scan");
+        var importDirectory = Path.Combine(output, "ocr-import");
+        Task.Run(() => OcrService.ImportLanguageAsync(Path.Combine(OcrService.BundledDirectory, "eng.traineddata"), importDirectory)).GetAwaiter().GetResult();
+        var installedModel = Path.Combine(importDirectory, "eng.traineddata"); var modelBytes = File.ReadAllBytes(installedModel);
+        Check(modelBytes.SequenceEqual(File.ReadAllBytes(Path.Combine(OcrService.BundledDirectory, "eng.traineddata"))), "language package validated and imported offline");
+        var corruptDirectory = Path.Combine(output, "ocr-corrupt"); Directory.CreateDirectory(corruptDirectory);
+        var corruptModel = Path.Combine(corruptDirectory, "eng.traineddata"); File.WriteAllBytes(corruptModel, new byte[2048]);
+        Throws<InvalidOperationException>(() => Task.Run(() => OcrService.ImportLanguageAsync(corruptModel, importDirectory)).GetAwaiter().GetResult(), "corrupt language package rejected in child process");
+        Check(File.ReadAllBytes(installedModel).SequenceEqual(modelBytes), "failed import preserves installed language");
+        using var blank = PdfDocument.Create(); var blankRevision = blank.Revision;
+        var empty = Task.Run(() => OcrService.RecognizeAsync(blank, new[] { 0 }, options)).GetAwaiter().GetResult();
+        Check(empty.Empty == 1 && blank.Revision == blankRevision, "blank page does not acquire an empty OCR layer");
+        Console.WriteLine("PASS: Tesseract OCR, mixed languages, coordinates, invisible layer, permissions, save, undo/redo, cancellation");
     }
 
     private static void TestThreeD(string output, string[] args)
@@ -747,6 +815,13 @@ internal static class Program
         var graphicsDialog = new PDF_Reader.Views.GraphicsSettingsWindow(new SettingsService(Path.Combine(output, "3d-settings.json"))) { Owner = window, ShowActivated = false };
         graphicsDialog.Show(); Pump(800); SaveWindow(graphicsDialog, Path.Combine(output, "3d-graphics-settings.png"));
         Check(FindVisuals<System.Windows.Controls.ComboBox>(graphicsDialog).Any(c => c.Items.Count >= 2), "3D GPU settings exposes auto and WARP"); graphicsDialog.Close();
+        window.Themes.SetTheme(AppTheme.Light);
+        var ocrSettings = new PDF_Reader.Views.OcrSettingsWindow(new SettingsService(Path.Combine(output, "ocr-ui-settings.json"))) { Owner = window, ShowActivated = false };
+        ocrSettings.Show(); Pump(100); SaveWindow(ocrSettings, Path.Combine(output, "ocr-settings-light.png"));
+        Check(FindVisuals<System.Windows.Controls.CheckBox>(ocrSettings).Count(c => c.IsChecked == true) >= 3, "OCR settings expose selected Russian, English and dictionaries");
+        window.Themes.SetTheme(AppTheme.Dark); Pump(100); SaveWindow(ocrSettings, Path.Combine(output, "ocr-settings-dark.png"));
+        Check(((SolidColorBrush)ocrSettings.Background).Color.R < 128, "OCR settings follow live dark theme"); ocrSettings.Close();
+        window.Themes.SetTheme(AppTheme.Light);
         var threeDArgument = Array.IndexOf(args,"--3d-samples");
         if (threeDArgument >= 0 && threeDArgument+1 < args.Length)
         {
@@ -790,9 +865,27 @@ internal static class Program
         SaveWindow(messageDialog, Path.Combine(output, "message-dialog-dark.png"));
         messageDialog.Close();
 
+        UntilComplete(workspace.OpenPathAsync(Path.Combine(output, "ocr-scan.pdf")));
+        var scanPageItem = workspace.Pages[0];
+        var scanDialog = new PDF_Reader.Views.OcrWindow(workspace, new SettingsService(Path.Combine(output, "ocr-ui-settings.json"))) { Owner = window, ShowActivated = false };
+        scanDialog.Show(); Pump(100);
+        FindVisuals<System.Windows.Controls.Button>(scanDialog).Single(b => Equals(b.Content, "Распознать"))
+            .RaiseEvent(new RoutedEventArgs(System.Windows.Controls.Button.ClickEvent));
+        var ocrDeadline = DateTime.UtcNow.AddSeconds(30);
+        while (workspace.IsBusy && DateTime.UtcNow < ocrDeadline) Pump(50);
+        Pump(100);
+        Check(!workspace.IsBusy && workspace.Document!.ExtractText(0).Contains("Проверка"), "OCR dialog recognizes scan through workspace");
+        Check(ReferenceEquals(scanPageItem, workspace.Pages[0]), "single-page OCR refresh preserves page item");
+        SaveWindow(scanDialog, Path.Combine(output, "ocr-completed.png")); scanDialog.Close();
+        UntilComplete(workspace.ChangeAsync(d => d.Undo()));
+        Check(!workspace.Document!.IsDirty, "workspace OCR undo restores clean scan");
+        UntilComplete(workspace.CloseTabAsync(workspace.ActiveTab!));
+
         UntilComplete(workspace.OpenPathAsync(Path.Combine(output, "sample.pdf")));
         Pump(900);
         Check(workspace.HasDocument && workspace.Pages.Count == 2, "WPF document workspace");
+        var ocrDialog = new PDF_Reader.Views.OcrWindow(workspace, new SettingsService(Path.Combine(output, "ocr-ui-settings.json"))) { Owner = window, ShowActivated = false };
+        ocrDialog.Show(); Pump(100); SaveWindow(ocrDialog, Path.Combine(output, "ocr-dialog.png")); ocrDialog.Close();
         workspace.FitWidthCommand.Execute(null);
         Pump(900);
         SaveWindow(window, Path.Combine(output, "workspace.png"));

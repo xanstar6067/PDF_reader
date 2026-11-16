@@ -6,6 +6,20 @@ namespace PDF_Reader.Tests;
 
 internal static class PdfFixture
 {
+    public static byte[] CreateScan(System.Windows.Media.Imaging.BitmapSource image)
+    {
+        var rgb = new System.Windows.Media.Imaging.FormatConvertedBitmap(image, System.Windows.Media.PixelFormats.Rgb24, null, 0);
+        var stride = rgb.PixelWidth * 3; var pixels = new byte[stride * rgb.PixelHeight]; rgb.CopyPixels(pixels, stride, 0);
+        using var compressed = new MemoryStream();
+        using (var z = new System.IO.Compression.ZLibStream(compressed, System.IO.Compression.CompressionLevel.Fastest, true)) z.Write(pixels);
+        var bytes = compressed.ToArray();
+        return Build([
+            "<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /XObject << /Scan 5 0 R >> >> /Contents 4 0 R >>",
+            PlainStream("q 595 0 0 842 0 0 cm /Scan Do Q"),
+            $"<< /Type /XObject /Subtype /Image /Width {rgb.PixelWidth} /Height {rgb.PixelHeight} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length {bytes.Length} >>\nstream\n" + Encoding.Latin1.GetString(bytes) + "\nendstream"
+        ]);
+    }
     public static byte[] Create3D(bool flate = false)
     {
         byte[] Payload(Action<BinaryWriter> write) { using var m=new MemoryStream();using(var w=new BinaryWriter(m,Encoding.UTF8,true))write(w);return m.ToArray(); }
