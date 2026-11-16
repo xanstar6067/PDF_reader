@@ -20,6 +20,8 @@ public sealed class OcrSettingsWindow : Window
         SourceInitialized += (_, _) => ThemeService.UpdateTitleBar(this);
         var panel = new StackPanel { Margin = new Thickness(24) };
         Content = new ScrollViewer { Content = panel, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
+        var enabled = new CheckBox { Content = "Распознавать текст просматриваемых страниц в фоне", IsChecked = settings.Value.Ocr.Enabled, Margin = new Thickness(0, 0, 0, 12) }; panel.Children.Add(enabled);
+        panel.Children.Add(new TextBlock { Text = "OCR запускается после остановки прокрутки. Текст доступен для выделения и копирования только в этом сеансе; PDF не изменяется.", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 16) });
         panel.Children.Add(new TextBlock { Text = "Языки OCR", FontSize = 19, FontWeight = FontWeights.SemiBold });
         panel.Children.Add(new TextBlock { Text = "Выберите языки документа. Русский и английский включены в поставку.", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 12) });
         panel.Children.Add(new ScrollViewer { Content = _languages, MaxHeight = 160, VerticalScrollBarVisibility = ScrollBarVisibility.Auto });
@@ -47,7 +49,7 @@ public sealed class OcrSettingsWindow : Window
         {
             try
             {
-                var value = new OcrOptions { Languages = SelectedLanguages(), Dpi = (int)dpi.SelectedItem, PageSegmentation = (int)segmentation.SelectedValue,
+                var value = new OcrOptions { Enabled = enabled.IsChecked == true, Languages = SelectedLanguages(), Dpi = (int)dpi.SelectedItem, PageSegmentation = (int)segmentation.SelectedValue,
                     UseDictionaries = dictionaries.IsChecked == true, PreserveSpaces = spaces.IsChecked == true };
                 value.Validate(); settings.Value.Ocr = value; settings.TrySave(); DialogResult = true;
             }

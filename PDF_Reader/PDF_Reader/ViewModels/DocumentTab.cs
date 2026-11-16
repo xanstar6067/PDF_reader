@@ -5,6 +5,7 @@ namespace PDF_Reader.ViewModels;
 public sealed class DocumentTab(PdfDocument document, string recoveryId) : ObservableObject, IDisposable
 {
     public PdfDocument Document { get; } = document;
+    internal OcrCache Ocr { get; } = new(document);
     public int LastPage { get; set; } = 1;
 
     /// <summary>Name of this tab's autosaved copy in the recovery folder.</summary>
@@ -22,5 +23,5 @@ public sealed class DocumentTab(PdfDocument document, string recoveryId) : Obser
         Notify(nameof(Path));
     }
 
-    public void Dispose() => Document.Dispose();
+    public void Dispose() { Ocr.Dispose(); Document.Dispose(); }
 }

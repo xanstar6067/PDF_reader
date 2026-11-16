@@ -6,17 +6,19 @@ namespace PDF_Reader.Tests;
 
 internal static class PdfFixture
 {
-    public static byte[] CreateScan(System.Windows.Media.Imaging.BitmapSource image)
+    public static byte[] CreateScan(System.Windows.Media.Imaging.BitmapSource image, int rotation = 0)
     {
         var rgb = new System.Windows.Media.Imaging.FormatConvertedBitmap(image, System.Windows.Media.PixelFormats.Rgb24, null, 0);
         var stride = rgb.PixelWidth * 3; var pixels = new byte[stride * rgb.PixelHeight]; rgb.CopyPixels(pixels, stride, 0);
         using var compressed = new MemoryStream();
         using (var z = new System.IO.Compression.ZLibStream(compressed, System.IO.Compression.CompressionLevel.Fastest, true)) z.Write(pixels);
         var bytes = compressed.ToArray();
+        var box = rotation % 2 == 0 ? "595 842" : "842 595";
+        var transform = rotation switch { 1 => "0 595 -842 0 842 0", 2 => "-595 0 0 -842 595 842", 3 => "0 -595 842 0 0 595", _ => "595 0 0 842 0 0" };
         return Build([
             "<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /XObject << /Scan 5 0 R >> >> /Contents 4 0 R >>",
-            PlainStream("q 595 0 0 842 0 0 cm /Scan Do Q"),
+            $"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {box}] /Rotate {rotation * 90} /Resources << /XObject << /Scan 5 0 R >> >> /Contents 4 0 R >>",
+            PlainStream($"q {transform} cm /Scan Do Q"),
             $"<< /Type /XObject /Subtype /Image /Width {rgb.PixelWidth} /Height {rgb.PixelHeight} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length {bytes.Length} >>\nstream\n" + Encoding.Latin1.GetString(bytes) + "\nendstream"
         ]);
     }

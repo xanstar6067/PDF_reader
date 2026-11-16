@@ -67,6 +67,14 @@ public sealed class PdfPageControl : FrameworkElement
     private PdfComment? _dragAnnotation;
     private Point _resizeFixed;
     private readonly List<Point> _ink = [];
+    private CancellationTokenSource? _ocr;
+    private Task? _ocrWork;
+    private WorkspaceViewModel? _ocrWorkspace;
+    private Window? _ocrWindow;
+    private string? _ocrError;
+    private int _selectionRequest;
+    private CancellationTokenSource? _selectionUpdate;
+    internal const int OcrIdleMilliseconds = 800;
 
     private static Brush FrozenBrush(Color color)
     {
@@ -86,14 +94,20 @@ public sealed class PdfPageControl : FrameworkElement
         Focusable = true;
         ClipToBounds = true;
         UseLayoutRounding = true;
+        // Focusing a tall page for Ctrl+C must not scroll it or cancel OCR under the pointer.
+        RequestBringIntoView += (_, e) => e.Handled = true;
         Loaded += OnLoaded;
         Unloaded += OnUnloaded;
         SizeChanged += (_, _) => RenderPage();
+        InputBindings.Add(new KeyBinding(ApplicationCommands.Copy, Key.C, ModifierKeys.Control));
+        var copyMenu = new ContextMenu();
+        copyMenu.Items.Add(new MenuItem { Header = "Копировать", Command = ApplicationCommands.Copy, CommandTarget = this, InputGestureText = "Ctrl+C" });
+        ContextMenu = copyMenu;
         CommandBindings.Add(new CommandBinding(ApplicationCommands.Copy,
-            (_, e) =>
+            async (_, e) =>
             {
-                if (!string.IsNullOrEmpty(_selection?.Text)) Clipboard.SetText(_selection.Text);
                 e.Handled = true;
+                await CopySelectionAsync();
             },
             (_, e) =>
             {
@@ -108,6 +122,10 @@ public sealed class PdfPageControl : FrameworkElement
         {
             _viewer = FindAncestor<ScrollViewer>(this);
             if (_viewer is not null) _viewer.ScrollChanged += OnScrollChanged;
+            _ocrWorkspace = Workspace;
+            if (_ocrWorkspace is not null) _ocrWorkspace.OcrSettingsChanged += ScheduleOcr;
+            _ocrWindow = Window.GetWindow(this);
+            if (_ocrWindow is not null) _ocrWindow.StateChanged += OnOcrWindowStateChanged;
         }
         RenderPage();
     }
@@ -116,6 +134,12 @@ public sealed class PdfPageControl : FrameworkElement
     {
         if (_viewer is not null) _viewer.ScrollChanged -= OnScrollChanged;
         _viewer = null;
+        if (_ocrWorkspace is not null) _ocrWorkspace.OcrSettingsChanged -= ScheduleOcr;
+        if (_ocrWindow is not null) _ocrWindow.StateChanged -= OnOcrWindowStateChanged;
+        _ocrWorkspace = null; _ocrWindow = null;
+        Cancel(ref _ocr); _ocrWork = null;
+        Cancel(ref _selectionUpdate);
+        _selectionRequest++;
         Cancel(ref _render);
         Cancel(ref _detailRender);
         _image = null;
@@ -143,6 +167,9 @@ public sealed class PdfPageControl : FrameworkElement
         view._image = null;
         view._detail = null;
         view._selection = null;
+        Cancel(ref view._selectionUpdate);
+        view._selectionRequest++;
+        view._ocrError = null;
         view._error = null;
         view._anchor = null;
         view._drag = Drag.None;
@@ -151,7 +178,13 @@ public sealed class PdfPageControl : FrameworkElement
     }
 
     // The previous images stay on screen until the new content is ready, so edits do not flash.
-    private static void VersionChanged(DependencyObject d, DependencyPropertyChangedEventArgs e) => ((PdfPageControl)d).RenderPage(15);
+    private static void VersionChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+    {
+        var view = (PdfPageControl)d;
+        view._selection = null; view._selectionRequest++;
+        Cancel(ref view._selectionUpdate);
+        view.RenderPage(15);
+    }
 
     private (int Width, int Height) DeviceSize()
     {
@@ -165,6 +198,7 @@ public sealed class PdfPageControl : FrameworkElement
     private async void RenderPage(int delay = 90)
     {
         Cancel(ref _render);
+        ScheduleOcr();
         if (!IsLoaded || Item is not { } item || ActualWidth < 1 || ActualHeight < 1) return;
         var (deviceWidth, deviceHeight) = DeviceSize();
         var width = UsesDetail(deviceWidth, deviceHeight)
@@ -209,7 +243,44 @@ public sealed class PdfPageControl : FrameworkElement
         }
     }
 
-    private void OnScrollChanged(object sender, ScrollChangedEventArgs e) => UpdateDetail();
+    private void OnScrollChanged(object sender, ScrollChangedEventArgs e)
+    {
+        UpdateDetail();
+        if (e.VerticalChange != 0 || e.HorizontalChange != 0 || e.ViewportHeightChange != 0 || e.ViewportWidthChange != 0 || e.ExtentHeightChange != 0)
+            ScheduleOcr();
+    }
+
+    private void OnOcrWindowStateChanged(object? sender, EventArgs e) => ScheduleOcr();
+
+    private void ScheduleOcr()
+    {
+        Cancel(ref _ocr);
+        _ocrWork = null; _ocrError = null;
+        if (Thumbnail || !IsLoaded || !IsVisible || Item is not { } item || Workspace is not { BackgroundOcrEnabled: true } ||
+            _ocrWindow?.WindowState == WindowState.Minimized) return;
+        _ocr = new CancellationTokenSource();
+        Workspace.SetOcrStatus(item, "OCR: ожидание остановки прокрутки");
+        _ocrWork = RecognizeStablePageAsync(item, item.Version, _ocr.Token);
+    }
+
+    private async Task RecognizeStablePageAsync(PageItem item, int version, CancellationToken cancellation)
+    {
+        try
+        {
+            await Task.Delay(OcrIdleMilliseconds, cancellation);
+            var visible = VisibleRect();
+            if (visible.IsEmpty || visible.Width < 8 || visible.Height < 8 || Item != item || item.Version != version) return;
+            if (Workspace is { } workspace) await workspace.PrepareVisibleOcrAsync(item, cancellation);
+        }
+        catch (OperationCanceledException) { }
+        catch (ObjectDisposedException) { }
+        catch (Exception ex)
+        {
+            if (cancellation.IsCancellationRequested || Item != item) return;
+            _ocrError = ex.Message;
+            ErrorLog.Write("Фоновое распознавание страницы", ex);
+        }
+    }
 
     private Rect VisibleRect()
     {
@@ -334,9 +405,6 @@ public sealed class PdfPageControl : FrameworkElement
                 }
                 dc.DrawGeometry(null, ShapePen(vm), geometry);
                 break;
-            case Drag.Text:
-                dc.DrawRectangle(SelectionBrush, new Pen(Brushes.SteelBlue, .75), new Rect(anchor, _dragPoint));
-                break;
         }
     }
 
@@ -398,6 +466,8 @@ public sealed class PdfPageControl : FrameworkElement
         // Make this the current page first, so selecting an annotation does not scroll the view.
         vm.SetVisiblePage(index);
         _selection = null;
+        Cancel(ref _selectionUpdate);
+        _selectionRequest++;
         _drag = Drag.Text;
         if (vm.Tool == DocumentTool.Select)
         {
@@ -430,6 +500,8 @@ public sealed class PdfPageControl : FrameworkElement
         }
         _anchor = position;
         _dragPoint = position;
+        if (_drag == Drag.Text && _anchor is { } anchor && Workspace?.Tool is DocumentTool.Select or DocumentTool.Highlight or DocumentTool.Underline or DocumentTool.StrikeOut)
+            _ = UpdateTextSelectionAsync(Normalize(anchor), Normalize(position));
         CaptureMouse();
         InvalidateVisual();
     }
@@ -462,7 +534,7 @@ public sealed class PdfPageControl : FrameworkElement
             case DocumentTool.Select:
                 if (vm.SelectedAnnotation is { CanResize: true } selected && selected.PageIndex == item.Info.Index && ResizeAnchorAt(selected, position) is { } opposite)
                     return (opposite.X < position.X) == (opposite.Y < position.Y) ? Cursors.SizeNWSE : Cursors.SizeNESW;
-                return vm.HitAnnotation(item.Info.Index, Normalize(position), Tolerance, movableOnly: true) is not null ? Cursors.SizeAll : Cursors.Arrow;
+                return vm.HitAnnotation(item.Info.Index, Normalize(position), Tolerance, movableOnly: true) is not null ? Cursors.SizeAll : Cursors.IBeam;
             default:
                 return Cursors.Arrow;
         }
@@ -517,17 +589,11 @@ public sealed class PdfPageControl : FrameworkElement
             }
             else if (dragged)
             {
-                var selection = await Task.Run(() => item.Document.SelectText(index, startNormalized, endNormalized));
-                if (vm.Document != item.Document || Item != item) return;
+                var selection = await UpdateTextSelectionAsync(startNormalized, endNormalized, final: true);
+                if (selection is null) return;
                 if (vm.Tool is DocumentTool.Highlight or DocumentTool.Underline or DocumentTool.StrikeOut && selection.Rectangles.Count > 0)
                 {
                     await vm.AddTextMarkupAsync(index, selection.Rectangles);
-                }
-                else
-                {
-                    _selection = selection;
-                    vm.Status = string.IsNullOrEmpty(selection.Text) ? "Здесь нет текстового слоя. Для скана требуется OCR." : "Текст выделен • Ctrl+C — копировать";
-                    InvalidateVisual();
                 }
             }
             else if (vm.Tool == DocumentTool.Select)
@@ -552,11 +618,76 @@ public sealed class PdfPageControl : FrameworkElement
     protected override void OnLostMouseCapture(MouseEventArgs e)
     {
         // A lost capture (another window, Alt+Tab) cancels the gesture; a normal release has already consumed it.
+        if (_anchor is not null) { _selection = null; _selectionRequest++; }
+        Cancel(ref _selectionUpdate);
         _anchor = null;
         _drag = Drag.None;
         _dragAnnotation = null;
         _ink.Clear();
         InvalidateVisual();
         base.OnLostMouseCapture(e);
+    }
+
+    // Used by both the live mouse gesture and its final release. Positions are normalized to the page.
+    internal async Task<TextSelection?> UpdateTextSelectionAsync(Point from, Point to, bool final = false)
+    {
+        Cancel(ref _selectionUpdate);
+        if (Thumbnail || Item is not { } item || Workspace is not { CanInteract: true } vm) return null;
+        if (vm.Tool is not (DocumentTool.Select or DocumentTool.Highlight or DocumentTool.Underline or DocumentTool.StrikeOut)) return null;
+        var source = new CancellationTokenSource(); _selectionUpdate = source;
+        var token = source.Token; var request = ++_selectionRequest; var version = item.Version; var tool = vm.Tool;
+        try
+        {
+            if (!final) await Task.Delay(35, token); // Coalesce mouse moves while keeping selection visible during the drag.
+            var selection = await vm.SelectPageTextAsync(item, from, to);
+            while (final && string.IsNullOrEmpty(selection.Text) && _ocrWork is { IsCompleted: false } pending)
+            {
+                vm.Status = "Распознавание текста… Выделение появится после завершения.";
+                await pending.WaitAsync(token);
+                token.ThrowIfCancellationRequested();
+                if (Item != item || item.Version != version || vm.Document != item.Document) return null;
+                selection = await vm.SelectPageTextAsync(item, from, to);
+            }
+            token.ThrowIfCancellationRequested();
+            if (vm.Document != item.Document || Item != item || item.Version != version || request != _selectionRequest || vm.Tool != tool) return null;
+            _selection = selection;
+            InvalidateVisual();
+            CommandManager.InvalidateRequerySuggested();
+            if (final)
+            {
+                Focus();
+                vm.Status = !string.IsNullOrEmpty(selection.Text) ? "Текст выделен • Ctrl+C или правая кнопка мыши — копировать"
+                    : _ocrError is not null ? "Не удалось распознать текст: " + _ocrError
+                    : vm.BackgroundOcrEnabled ? "Здесь не найден текст для выделения." : "Для текста на скане включите фоновое OCR в меню «Документ».";
+            }
+            return selection;
+        }
+        catch (OperationCanceledException) { return null; }
+        catch (ObjectDisposedException) { return null; }
+        catch (Exception ex)
+        {
+            if (final) vm.ShowError(ex); else ErrorLog.Write("Выделение текста", ex);
+            return null;
+        }
+    }
+
+    private async Task CopySelectionAsync()
+    {
+        if (string.IsNullOrEmpty(_selection?.Text)) return;
+        var text = _selection.Text;
+        for (var attempt = 0; attempt < 5; attempt++)
+        {
+            try
+            {
+                Clipboard.SetText(text);
+                if (Workspace is { } vm) vm.Status = "Выделенный текст скопирован";
+                return;
+            }
+            catch (System.Runtime.InteropServices.ExternalException)
+            {
+                if (attempt < 4) await Task.Delay(60);
+            }
+        }
+        if (Workspace is { } workspace) workspace.Status = "Буфер обмена занят. Повторите Ctrl+C.";
     }
 }

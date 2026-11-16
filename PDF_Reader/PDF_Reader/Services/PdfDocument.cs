@@ -42,6 +42,8 @@ public sealed class PdfDocument : IDisposable
     private volatile int _pageCount;
     private volatile bool _canUndo, _canRedo, _isDirty;
     private long _revision;
+    private readonly Dictionary<int, PdfTextMap> _selectionMaps = [];
+    private long _selectionMapRevision = -1;
 
     private record Snapshot(byte[] Bytes, long State);
 
@@ -233,6 +235,7 @@ public sealed class PdfDocument : IDisposable
             _undo.Clear();
             _redo.Clear();
             _buffer = [];
+            _selectionMaps.Clear();
             Publish();
         }
     }
@@ -437,11 +440,29 @@ public sealed class PdfDocument : IDisposable
     {
         lock (Gate)
         {
-            RequirePermission(8 | 16, "Для OCR требуются разрешения на изменение и копирование текста PDF.");
+            RequirePermission(16, "Распознавание текста запрещено настройками копирования PDF.");
             cancellation.ThrowIfCancellationRequested();
             return OnPage(index, page =>
             {
-                if (OnText(page, t => !string.IsNullOrWhiteSpace(GetText(t, 0, Pdfium.FPDFText_CountChars(t))))) return null;
+                // Native text pages need no OCR. Mixed pages still need it for text inside their images.
+                if (OnText(page, t => !string.IsNullOrWhiteSpace(GetText(t, 0, Pdfium.FPDFText_CountChars(t)))))
+                {
+                    var budget = 10000;
+                    bool HasImage(nint obj, int depth)
+                    {
+                        if (--budget <= 0 || depth > 16) return true; // Conservatively OCR unusually complex forms.
+                        var type = Pdfium.FPDFPageObj_GetType(obj);
+                        if (type == 3) return true;
+                        if (type != 5) return false;
+                        var count = Pdfium.FPDFFormObj_CountObjects(obj);
+                        for (uint i = 0; i < count; i++) if (HasImage(Pdfium.FPDFFormObj_GetObject(obj, i), depth + 1)) return true;
+                        return false;
+                    }
+                    var hasImages = false;
+                    for (var i = 0; i < Pdfium.FPDFPage_CountObjects(page); i++)
+                        if (HasImage(Pdfium.FPDFPage_GetObject(page, i), 0)) { hasImages = true; break; }
+                    if (!hasImages) return null;
+                }
                 var width = Pdfium.FPDF_GetPageWidthF(page); var height = Pdfium.FPDF_GetPageHeightF(page);
                 var requested = (int)Math.Clamp(Math.Ceiling(width * dpi / 72), 16, MaxRenderSide);
                 var size = FitRenderSize(width, height, requested);
@@ -450,61 +471,41 @@ public sealed class PdfDocument : IDisposable
         }
     }
 
-    internal void AddOcrLayer(int index, long expectedRevision, byte[] textPdf)
+    public TextSelection SelectText(int index, Point from, Point to)
     {
-        lock (Gate)
-        {
-            RequirePermission(8 | 16, "Для OCR требуются разрешения на изменение и копирование текста PDF.");
-            if (Revision != expectedRevision) throw new InvalidOperationException("Документ изменился во время распознавания. Запустите OCR ещё раз.");
-            using var source = FromBytes(textPdf);
-            if (source.PageCount != 1 || string.IsNullOrWhiteSpace(source.ExtractText(0))) throw new InvalidDataException("В результате OCR нет текстового слоя.");
-            Edit(() => OnPage(index, page =>
-            {
-                if (OnText(page, t => !string.IsNullOrWhiteSpace(GetText(t, 0, Pdfium.FPDFText_CountChars(t)))))
-                    throw new InvalidOperationException("На странице уже есть текстовый слой.");
-                var size = source.GetPages()[0];
-                var origin = ToPdf(page, new Point(0, 1));
-                var right = ToPdf(page, new Point(1, 1));
-                var top = ToPdf(page, new Point(0, 0));
-                var template = Pdfium.FPDF_NewXObjectFromPage(_handle, source._handle, 0);
-                if (template == 0) throw new InvalidOperationException("Не удалось перенести текстовый слой OCR.");
-                nint obj;
-                try { obj = Pdfium.FPDF_NewFormObjectFromXObject(template); }
-                finally { Pdfium.FPDF_CloseXObject(template); }
-                if (obj == 0) throw new InvalidOperationException("Не удалось создать объект OCR.");
-                var matrix = new Pdfium.Matrix
-                {
-                    A = (float)((right.X - origin.X) / size.Width), B = (float)((right.Y - origin.Y) / size.Width),
-                    C = (float)((top.X - origin.X) / size.Height), D = (float)((top.Y - origin.Y) / size.Height),
-                    E = (float)origin.X, F = (float)origin.Y
-                };
-                if (Pdfium.FPDFPageObj_SetMatrix(obj, ref matrix) == 0 || Pdfium.FPDFPage_InsertObject(page, obj) == 0)
-                {
-                    Pdfium.FPDFPageObj_Destroy(obj);
-                    throw new InvalidOperationException("Не удалось разместить текстовый слой OCR.");
-                }
-                Generate(page);
-                return true;
-            }));
-        }
+        return GetSelectionMap(index).Select(from, to);
     }
 
-    public TextSelection SelectText(int index, Point from, Point to)
+    internal PdfTextMap GetSelectionMap(int index)
     {
         lock (Gate)
         {
             RequirePermission(16, "Копирование текста запрещено владельцем PDF.");
-            return OnPage(index, p => OnText(p, t =>
+            if (_selectionMapRevision != Revision) { _selectionMaps.Clear(); _selectionMapRevision = Revision; }
+            if (_selectionMaps.TryGetValue(index, out var cached)) return cached;
+            var map = OnPage(index, p => OnText(p, t =>
             {
-                var a = ToPdf(p, from);
-                var b = ToPdf(p, to);
-                var first = Pdfium.FPDFText_GetCharIndexAtPos(t, a.X, a.Y, 12, 12);
-                var last = Pdfium.FPDFText_GetCharIndexAtPos(t, b.X, b.Y, 12, 12);
-                if (first < 0 || last < 0) return new TextSelection("", []);
-                var start = Math.Min(first, last);
-                var count = Math.Abs(last - first) + 1;
-                return new TextSelection(GetText(t, start, count), GetRects(p, t, start, count));
+                var text = new StringBuilder(); var glyphs = new List<PdfTextMap.Glyph>();
+                var count = Pdfium.FPDFText_CountChars(t);
+                for (var i = 0; i < count; i++)
+                {
+                    var unicode = Pdfium.FPDFText_GetUnicode(t, i);
+                    if (unicode == 0 || !Rune.IsValid(unicode)) continue;
+                    var rune = new Rune(unicode); var start = text.Length; text.Append(rune.ToString());
+                    if (Rune.IsWhiteSpace(rune) || Pdfium.FPDFText_GetCharBox(t, i, out var l, out var r, out var b, out var top) == 0) continue;
+                    if (!double.IsFinite(l) || !double.IsFinite(r) || !double.IsFinite(b) || !double.IsFinite(top)) continue;
+                    var rect = new Rect(ToDisplay(p, l, top), ToDisplay(p, r, b));
+                    if (rect.Width > 0 && rect.Height > 0) glyphs.Add(new(start, rune.Utf16SequenceLength, rect));
+                }
+                var direction = ToDisplay(p, 100, 0) - ToDisplay(p, 0, 0);
+                var vertical = Math.Abs(direction.Y) > Math.Abs(direction.X);
+                return new PdfTextMap(text.ToString(), glyphs.ToArray(), vertical, vertical ? direction.Y > 0 : direction.X > 0);
             }));
+            // Native maps are bounded independently of the per-tab OCR cache.
+            while (_selectionMaps.Count > 0 && (_selectionMaps.Count >= 4 || _selectionMaps.Values.Sum(m => (long)m.ByteCount) + map.ByteCount > 16 * 1024 * 1024))
+                _selectionMaps.Remove(_selectionMaps.Keys.First());
+            _selectionMaps[index] = map;
+            return map;
         }
     }
 

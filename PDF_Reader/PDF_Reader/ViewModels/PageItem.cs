@@ -7,6 +7,8 @@ public sealed class PageItem(PdfDocument document, PdfPageInfo info, double zoom
 {
     private double _zoom = zoom;
     private int _version;
+    internal string OcrStatus { get; set; } = "";
+    internal long OcrStatusVersion { get; set; }
 
     public PdfDocument Document { get; } = document;
     public PdfPageInfo Info { get; } = info;

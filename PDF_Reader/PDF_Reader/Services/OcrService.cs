@@ -10,6 +10,8 @@ namespace PDF_Reader.Services;
 public static class OcrService
 {
     private static readonly SemaphoreSlim Slots = new(1);
+    private static long _languageRevision;
+    internal static long LanguageRevision => Interlocked.Read(ref _languageRevision);
     public static string BundledDirectory => Path.Combine(AppContext.BaseDirectory, "tessdata");
     public static string UserDirectory => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "PaperDesk", "tessdata");
 
@@ -47,22 +49,24 @@ public static class OcrService
             cancellation.ThrowIfCancellationRequested();
             Directory.CreateDirectory(targetDirectory);
             AtomicFile.Write(Path.Combine(targetDirectory, code + ".traineddata"), await File.ReadAllBytesAsync(staged, cancellation).ConfigureAwait(false));
+            Interlocked.Increment(ref _languageRevision);
         }
         finally { Cleanup(directory); Slots.Release(); }
     }
 
-    public static async Task<OcrSummary> RecognizeAsync(PdfDocument document, IReadOnlyList<int> pages, OcrOptions options,
-        IProgress<OcrProgress>? progress = null, CancellationToken cancellation = default)
+    internal static async Task<OcrPage?> RecognizePageAsync(PdfDocument document, int index, OcrOptions options, CancellationToken cancellation = default)
     {
         options.Validate();
         options = options with { Languages = options.Languages.ToArray() };
-        if (pages.Count == 0 || pages.Distinct().Count() != pages.Count || pages.Any(i => i < 0 || i >= document.PageCount))
-            throw new ArgumentException("Некорректный диапазон страниц OCR.");
+        if (index < 0 || index >= document.PageCount) throw new ArgumentOutOfRangeException(nameof(index));
+        if (!options.Enabled) return null;
         await Slots.WaitAsync(cancellation).ConfigureAwait(false);
         var directory = TemporaryDirectory();
-        var recognized = 0; var skipped = 0; var empty = 0;
         try
         {
+            // Check permission and native text before copying language data or starting a process.
+            var input = document.PrepareOcrPage(index, options.Dpi, cancellation);
+            if (input is null) return null;
             Directory.CreateDirectory(directory);
             var data = Path.Combine(directory, "tessdata"); Directory.CreateDirectory(data);
             foreach (var code in options.Languages)
@@ -74,34 +78,19 @@ public static class OcrService
                 File.Copy(source, Path.Combine(data, file));
             }
             File.Copy(Path.Combine(BundledDirectory, "pdf.ttf"), Path.Combine(data, "pdf.ttf"));
-            for (var n = 0; n < pages.Count; n++)
-            {
-                cancellation.ThrowIfCancellationRequested();
-                var index = pages[n];
-                progress?.Report(new(n, pages.Count, $"Распознавание страницы {index + 1} ({n + 1} из {pages.Count})…"));
-                // Caller and all native/raster work run on background threads, never the UI thread.
-                var input = document.PrepareOcrPage(index, options.Dpi, cancellation);
-                if (input is null) { skipped++; continue; }
-                var pageDirectory = Path.Combine(directory, "page"); Directory.CreateDirectory(pageDirectory);
-                try
-                {
-                    var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(input.Image));
-                    using (var stream = File.Create(Path.Combine(pageDirectory, "page.png"))) encoder.Save(stream);
-                    await RunWorkerAsync(pageDirectory, new(data, options), cancellation).ConfigureAwait(false);
-                    cancellation.ThrowIfCancellationRequested();
-                    if (File.Exists(Path.Combine(pageDirectory, "empty"))) { empty++; continue; }
-                    var result = Path.Combine(pageDirectory, "text.pdf");
-                    if (!File.Exists(result) || new FileInfo(result).Length is < 100 or > 16 * 1024 * 1024)
-                        throw new InvalidDataException("Некорректный результат OCR.");
-                    var bytes = await File.ReadAllBytesAsync(result, cancellation).ConfigureAwait(false);
-                    cancellation.ThrowIfCancellationRequested();
-                    document.AddOcrLayer(index, input.Revision, bytes);
-                    recognized++;
-                }
-                finally { Cleanup(pageDirectory); }
-            }
-            progress?.Report(new(pages.Count, pages.Count, "Распознавание завершено"));
-            return new(recognized, skipped, empty);
+            var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(input.Image));
+            using (var stream = File.Create(Path.Combine(directory, "page.png"))) encoder.Save(stream);
+            await RunWorkerAsync(directory, new(data, options), cancellation).ConfigureAwait(false);
+            cancellation.ThrowIfCancellationRequested();
+            if (document.Revision != input.Revision) throw new OperationCanceledException("Страница изменилась во время OCR.");
+            if (File.Exists(Path.Combine(directory, "empty"))) return new OcrPage([]);
+            var result = Path.Combine(directory, "text.pdf");
+            if (!File.Exists(result) || new FileInfo(result).Length is < 100 or > 16 * 1024 * 1024)
+                throw new InvalidDataException("Некорректный результат OCR.");
+            // This text-only PDF is an internal transport for text/geometry. It never enters the user's document.
+            var bytes = await File.ReadAllBytesAsync(result, cancellation).ConfigureAwait(false);
+            cancellation.ThrowIfCancellationRequested();
+            return new OcrPage(bytes);
         }
         finally { Cleanup(directory); Slots.Release(); }
     }

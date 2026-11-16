@@ -85,7 +85,6 @@
                         <MenuItem Header="Полноэкранный режим" Click="FullScreen_Click" InputGestureText="F11"/>
                     </MenuItem>
                     <MenuItem Header="_Документ">
-                        <MenuItem Header="Распознать текст (OCR)…" Click="Ocr_Click" IsEnabled="{Binding CanInteract}"/>
                         <MenuItem Header="Настройки OCR и языки…" Click="OcrSettings_Click" IsEnabled="{Binding IsBusy, Converter={StaticResource Not}}"/>
                         <Separator/>
                         <MenuItem Header="Повернуть страницу" Command="{Binding RotateCommand}"/>
@@ -594,6 +593,8 @@
             <DockPanel Margin="18,0">
                 <TextBlock DockPanel.Dock="Right" Text="{Binding DocumentSummary}" Foreground="{DynamicResource Muted}" FontSize="11"
                            VerticalAlignment="Center" Margin="20,0,0,0"/>
+                <TextBlock DockPanel.Dock="Right" Text="{Binding OcrStatus}" ToolTip="{Binding OcrStatus}" Foreground="{DynamicResource Muted}" FontSize="11"
+                           MaxWidth="360" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" Margin="16,0,0,0"/>
                 <TextBlock Text="{Binding Status}" Foreground="{DynamicResource Muted}" FontSize="11" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
             </DockPanel>
         </Border>

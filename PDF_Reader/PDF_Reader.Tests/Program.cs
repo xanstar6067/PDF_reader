@@ -28,6 +28,10 @@ internal static class Program
             Directory.CreateDirectory(output);
             ErrorLog.Path = Path.Combine(output, "errors.log");
 
+            var selectionSample = Array.IndexOf(args, "--selection-sample");
+            TestTextSelection(selectionSample >= 0 && selectionSample + 1 < args.Length ? args[selectionSample + 1] : null);
+            if (args.Contains("--selection-only")) return 0;
+
             TestOcr(output);
             if (args.Contains("--ocr-only")) return 0;
 
@@ -83,43 +87,67 @@ internal static class Program
         using (var protectedDoc = PdfDocument.FromBytes(PdfFixture.Create(encrypted: true, permissions: -20), "reader-secret"))
             Throws<UnauthorizedAccessException>(() => protectedDoc.PrepareOcrPage(0, 200, default), "OCR respects PDF copy restrictions even when editing is allowed");
 
-        using var hidden = PdfDocument.FromBytes(PdfFixture.CreateOcrLayer());
-        var sourceBounds = hidden.Search("Hidden", false, false, default).Single().Rectangles[0];
-        for (var rotation = 0; rotation < 4; rotation++)
-        {
-            using var target = PdfDocument.Create();
-            if (rotation > 0) target.RotatePage(0, rotation);
-            var before = target.Render(0, 400); var revision = target.Revision;
-            target.AddOcrLayer(0, revision, hidden.GetBytes());
-            Check(SameImage(before, target.Render(0, 400)), "OCR overlay is invisible at rotation " + rotation);
-            var match = target.Search("Hidden", false, false, default).Single(); var center = Center(match.Rectangles[0]);
-            Check((center - Center(sourceBounds)).Length < .002, "OCR coordinates follow display rotation " + rotation);
-            var bounds = match.Rectangles[0];
-            var selection = target.SelectText(0, new Point(bounds.Left + .001, center.Y), new Point(bounds.Right - .001, center.Y));
-            Check(selection.Text.Contains("Hidden"), "OCR text can be selected at rotation " + rotation);
-            Throws<InvalidOperationException>(() => target.AddOcrLayer(0, revision, hidden.GetBytes()), "stale OCR result rejected");
-        }
+        using (var copyOnly = PdfDocument.FromBytes(PdfFixture.Create(encrypted: true, permissions: -12), "reader-secret"))
+            Check(copyOnly.PrepareOcrPage(0, 200, default) is null, "background OCR requires no edit permission and reuses native text");
         using var original = PdfDocument.Create();
         original.AddText(0, new(.1, .15), "Проверка документа", 24);
         original.AddText(0, new(.1, .25), "PaperDesk document test", 24);
-        var scanBytes = PdfFixture.CreateScan(original.Render(0, 1654));
-        File.WriteAllBytes(Path.Combine(output, "ocr-scan.pdf"), scanBytes);
-        using var scan = PdfDocument.FromBytes(scanBytes); var baseline = scan.Render(0, 600);
-        Check(string.IsNullOrWhiteSpace(scan.ExtractText(0)), "generated scan contains no text layer");
+        var image = original.Render(0, 1654);
+        var scanBytes = PdfFixture.CreateScan(image);
+        var scanPath = Path.Combine(output, "ocr-scan.pdf"); File.WriteAllBytes(scanPath, scanBytes);
+        using var scan = PdfDocument.Open(scanPath); var baseline = scan.Render(0, 600);
+        var revision = scan.Revision; var canUndo = scan.CanUndo;
         var options = new OcrOptions { Dpi = 200, PageSegmentation = 6 };
-        var summary = Task.Run(() => OcrService.RecognizeAsync(scan, new[] { 0 }, options)).GetAwaiter().GetResult();
-        var text = scan.ExtractText(0); Console.WriteLine("OCR: " + text.Replace('\n', ' '));
-        Check(summary.Recognized == 1 && text.Contains("Проверка") && text.Contains("PaperDesk"), "Tesseract recognizes mixed Russian and English scan");
-        Check(SameImage(baseline, scan.Render(0, 600)), "OCR leaves original raster unchanged");
-        var repeat = Task.Run(() => OcrService.RecognizeAsync(scan, new[] { 0 }, options)).GetAwaiter().GetResult();
-        Check(repeat.Skipped == 1 && repeat.Recognized == 0, "existing text layer is skipped");
-        scan.Save(Path.Combine(output, "ocr-searchable.pdf"));
-        using (var reopened = PdfDocument.Open(Path.Combine(output, "ocr-searchable.pdf")))
-            Check(reopened.ExtractText(0).Contains("Проверка") && reopened.Search("PaperDesk", false, false, default).Count == 1, "OCR Unicode and search survive reopening");
-        scan.Undo(); Check(string.IsNullOrWhiteSpace(scan.ExtractText(0)), "OCR layer can be undone");
-        scan.Redo(); Check(scan.ExtractText(0).Contains("Проверка"), "OCR layer can be redone");
+        using var cache = new OcrCache(scan); using var view = new CancellationTokenSource();
+        var result = cache.EnsureAsync(0, options, view.Token).GetAwaiter().GetResult()!;
+        Console.WriteLine("OCR: " + result.Text.Replace('\n', ' '));
+        Check(result.Text.Contains("Проверка") && result.Text.Contains("PaperDesk"), "memory-only OCR recognizes Russian and English");
+        var bounds = original.Search("PaperDesk", false, false, default).Single().Rectangles[0];
+        var selection = Task.Run(() => result.Select(new Point(bounds.Left + .003, bounds.Top + bounds.Height / 2), new Point(bounds.Right - .003, bounds.Top + bounds.Height / 2))).GetAwaiter().GetResult();
+        Check(selection.Text.Contains("PaperDesk") && selection.Rectangles.Count > 0, "OCR cache provides mouse selection text and highlight rectangles");
+        var whitespaceSelection = result.Select(new Point(bounds.Left - .02, bounds.Top + bounds.Height / 2), new Point(.8, bounds.Top + bounds.Height / 2));
+        Check(whitespaceSelection.Text.Contains("PaperDesk document test"), "OCR selection tolerates drag endpoints in whitespace");
+        var backwards = result.Select(new Point(.8, bounds.Top + bounds.Height / 2), new Point(bounds.Left - .02, bounds.Top + bounds.Height / 2));
+        Check(backwards.Text == whitespaceSelection.Text, "reverse OCR selection has the same text");
+        Check(string.IsNullOrWhiteSpace(scan.ExtractText(0)) && !scan.IsDirty && scan.Revision == revision && scan.CanUndo == canUndo, "OCR leaves PDF text, revision, dirty flag and undo history unchanged");
+        Check(SameImage(baseline, scan.Render(0, 600)) && scan.GetBytes().SequenceEqual(scanBytes), "OCR preserves PDF bytes and displayed image");
+        scan.Save(scanPath); Check(File.ReadAllBytes(scanPath).SequenceEqual(scanBytes), "saving after background OCR keeps original file byte-identical");
+        view.Cancel();
+        Check(ReferenceEquals(result, cache.Get(0, options)), "scrolling away retains completed recognition");
+        Check(ReferenceEquals(result, cache.EnsureAsync(0, options, default).GetAwaiter().GetResult()), "returning to page reuses cached result");
+        Check(cache.Get(0, options with { Dpi = 300 }) is null, "OCR settings invalidate cached text");
+        cache.EnsureAsync(0, options, default).GetAwaiter().GetResult();
+        scan.RotatePage(0, 1); Check(cache.Get(0, options) is null, "document edits invalidate cached geometry"); scan.Undo();
+        Check(cache.EnsureAsync(0, options with { Enabled = false }, default).GetAwaiter().GetResult() is null, "background OCR can be disabled");
+        using (var interruptedCache = new OcrCache(scan))
+        {
+            using var movingView = new CancellationTokenSource();
+            var pending = interruptedCache.EnsureAsync(0, options, movingView.Token); movingView.Cancel();
+            Throws<OperationCanceledException>(() => pending.GetAwaiter().GetResult(), "scrolling cancels an unfinished recognition request");
+            var retried = interruptedCache.EnsureAsync(0, options, default).GetAwaiter().GetResult();
+            Check(retried?.Text.Contains("PaperDesk") == true, "recognition restarts after cancelled view releases the worker");
+        }
+        using (var twoPages = PdfDocument.FromBytes(scanBytes))
+        {
+            twoPages.ImportPages(scan, 1);
+            twoPages.Save(Path.Combine(output, "ocr-two-pages.pdf"));
+        }
+        using (var mixed = PdfDocument.FromBytes(scanBytes))
+        {
+            mixed.AddText(0, new(.1, .8), "Native footer", 16);
+            mixed.Save(Path.Combine(output, "ocr-mixed.pdf"));
+            var mixedResult = Task.Run(() => OcrService.RecognizePageAsync(mixed, 0, options)).GetAwaiter().GetResult();
+            Check(mixedResult?.Text.Contains("PaperDesk") == true && mixed.ExtractText(0).Contains("Native footer"), "mixed pages recognize image text while preserving native text");
+        }
+        for (var rotation = 1; rotation < 4; rotation++)
+        {
+            using var rotated = PdfDocument.FromBytes(PdfFixture.CreateScan(image, rotation));
+            var recognized = Task.Run(() => OcrService.RecognizePageAsync(rotated, 0, options)).GetAwaiter().GetResult()!;
+            var picked = Task.Run(() => recognized.Select(new Point(bounds.Left + .003, bounds.Top + bounds.Height / 2), new Point(bounds.Right - .003, bounds.Top + bounds.Height / 2))).GetAwaiter().GetResult();
+            Check(picked.Text.Contains("PaperDesk"), "background OCR follows rotated PDF display coordinates " + rotation);
+        }
         using var cancelled = PdfDocument.FromBytes(scanBytes); using var cancellation = new CancellationTokenSource(); cancellation.Cancel();
-        Throws<OperationCanceledException>(() => Task.Run(() => OcrService.RecognizeAsync(cancelled, new[] { 0 }, options, cancellation: cancellation.Token)).GetAwaiter().GetResult(), "OCR cancellation leaves document untouched");
+        Throws<OperationCanceledException>(() => Task.Run(() => OcrService.RecognizePageAsync(cancelled, 0, options, cancellation.Token)).GetAwaiter().GetResult(), "obsolete OCR requests can be cancelled");
         Check(!cancelled.IsDirty, "cancelled OCR does not modify scan");
         var importDirectory = Path.Combine(output, "ocr-import");
         Task.Run(() => OcrService.ImportLanguageAsync(Path.Combine(OcrService.BundledDirectory, "eng.traineddata"), importDirectory)).GetAwaiter().GetResult();
@@ -130,9 +158,49 @@ internal static class Program
         Throws<InvalidOperationException>(() => Task.Run(() => OcrService.ImportLanguageAsync(corruptModel, importDirectory)).GetAwaiter().GetResult(), "corrupt language package rejected in child process");
         Check(File.ReadAllBytes(installedModel).SequenceEqual(modelBytes), "failed import preserves installed language");
         using var blank = PdfDocument.Create(); var blankRevision = blank.Revision;
-        var empty = Task.Run(() => OcrService.RecognizeAsync(blank, new[] { 0 }, options)).GetAwaiter().GetResult();
-        Check(empty.Empty == 1 && blank.Revision == blankRevision, "blank page does not acquire an empty OCR layer");
-        Console.WriteLine("PASS: Tesseract OCR, mixed languages, coordinates, invisible layer, permissions, save, undo/redo, cancellation");
+        var empty = Task.Run(() => OcrService.RecognizePageAsync(blank, 0, options)).GetAwaiter().GetResult();
+        Check(empty is { Text.Length: 0 } && blank.Revision == blankRevision, "blank page produces an empty in-memory result");
+        Console.WriteLine("PASS: background OCR, memory cache, selection, mixed languages, rotations, permissions, byte preservation, cancellation");
+    }
+
+    private static void TestTextSelection(string? sample)
+    {
+        using var builder = PdfDocument.Create();
+        builder.AddText(0, new(.1, .15), "First line.\nSecond line!", 18);
+        var bytes = builder.GetBytes(); using var document = PdfDocument.FromBytes(bytes); var revision = document.Revision;
+        var first = document.Search("First line.", false, false, default).Single().Rectangles[0];
+        var second = document.Search("Second line!", false, false, default).Single().Rectangles[0];
+        var a = new Point(first.Left - .02, Center(first).Y); var b = new Point(first.Right + .1, Center(first).Y);
+        Check(document.SelectText(0, a, b).Text == "First line.", "native selection snaps whitespace endpoints to text caret");
+        Check(document.SelectText(0, b, a).Text == "First line.", "reverse native selection handles whitespace");
+        var multiline = document.SelectText(0, a, new Point(second.Right + .03, Center(second).Y));
+        Check(multiline.Text.Contains("First line.") && multiline.Text.Contains("Second line!") && multiline.Rectangles.Count == 2, "multi-line selection follows text lines with merged highlight rectangles");
+        Check(document.SelectText(0, new(.8, .8), new(.95, .9)).Text.Length == 0, "blank page area does not select distant text");
+        Check(document.Revision == revision && document.GetBytes().SequenceEqual(bytes), "selection is read only");
+        for (var rotation = 1; rotation < 4; rotation++)
+        {
+            using var rotated = PdfDocument.FromBytes(bytes); rotated.RotatePage(0, rotation);
+            var rect = rotated.Search("First line.", false, false, default).Single().Rectangles[0];
+            var from = rotation % 2 == 1 ? new Point(Center(rect).X, rect.Top - .01) : new Point(rect.Left - .01, Center(rect).Y);
+            var to = rotation % 2 == 1 ? new Point(Center(rect).X, rect.Bottom + .01) : new Point(rect.Right + .01, Center(rect).Y);
+            Check(rotated.SelectText(0, from, to).Text == "First line.", "caret selection follows native page rotation " + rotation);
+        }
+        if (sample is not null)
+        {
+            var sourceBytes = File.ReadAllBytes(sample); using var real = PdfDocument.Open(sample);
+            var probe = System.Text.RegularExpressions.Regex.Match(real.ExtractText(0), @"[\p{L}\p{N}]{5,}").Value;
+            if (probe.Length == 0) throw new ArgumentException("На первой странице образца нет слова для проверки выделения.");
+            var verified = 0;
+            foreach (var match in real.Search(probe, false, false, default).GroupBy(m => m.PageIndex).Select(g => g.First()))
+            {
+                var r = match.Rectangles[0];
+                var picked = real.SelectText(match.PageIndex, new Point(r.Left - .003, Center(r).Y), new Point(r.Right + .003, Center(r).Y));
+                Check(picked.Text.Contains(probe), "real PDF selection on page " + match.PageNumber); verified++;
+            }
+            Check(verified > 0 && !real.IsDirty && File.ReadAllBytes(sample).SequenceEqual(sourceBytes), "real PDF selection leaves source untouched");
+            Console.WriteLine($"PASS: selection on {verified} pages of read-only sample");
+        }
+        Console.WriteLine("PASS: caret selection, whitespace, reverse drag, multiple lines, native page rotations");
     }
 
     private static void TestThreeD(string output, string[] args)
@@ -865,27 +933,60 @@ internal static class Program
         SaveWindow(messageDialog, Path.Combine(output, "message-dialog-dark.png"));
         messageDialog.Close();
 
-        UntilComplete(workspace.OpenPathAsync(Path.Combine(output, "ocr-scan.pdf")));
+        UntilComplete(workspace.OpenPathAsync(Path.Combine(output, "ocr-two-pages.pdf")));
+        workspace.CurrentPage = 1; // A previous run may have persisted page 2 as this file's last position.
         var scanPageItem = workspace.Pages[0];
-        var scanDialog = new PDF_Reader.Views.OcrWindow(workspace, new SettingsService(Path.Combine(output, "ocr-ui-settings.json"))) { Owner = window, ShowActivated = false };
-        scanDialog.Show(); Pump(100);
-        FindVisuals<System.Windows.Controls.Button>(scanDialog).Single(b => Equals(b.Content, "Распознать"))
-            .RaiseEvent(new RoutedEventArgs(System.Windows.Controls.Button.ClickEvent));
+        var scanTab = workspace.ActiveTab!;
+        Check(workspace.CanInteract && !workspace.IsBusy && !workspace.Document!.IsDirty, "viewing a scan does not enter an editing operation");
+        Pump(PdfPageControl.OcrIdleMilliseconds / 2);
+        Check(scanTab.Ocr.Get(0, new OcrOptions()) is null, "OCR waits for stable viewing before starting");
+        var scanControl = FindVisuals<PdfPageControl>(window).First(c => !c.Thumbnail && ReferenceEquals(c.Item, scanPageItem));
+        var earlySelection = scanControl.UpdateTextSelectionAsync(new Point(.08, .241), new Point(.8, .241), final: true);
         var ocrDeadline = DateTime.UtcNow.AddSeconds(30);
-        while (workspace.IsBusy && DateTime.UtcNow < ocrDeadline) Pump(50);
-        Pump(100);
-        Check(!workspace.IsBusy && workspace.Document!.ExtractText(0).Contains("Проверка"), "OCR dialog recognizes scan through workspace");
-        Check(ReferenceEquals(scanPageItem, workspace.Pages[0]), "single-page OCR refresh preserves page item");
-        SaveWindow(scanDialog, Path.Combine(output, "ocr-completed.png")); scanDialog.Close();
-        UntilComplete(workspace.ChangeAsync(d => d.Undo()));
-        Check(!workspace.Document!.IsDirty, "workspace OCR undo restores clean scan");
+        while (scanTab.Ocr.Get(0, new OcrOptions()) is null && DateTime.UtcNow < ocrDeadline) Pump(50);
+        var cached = scanTab.Ocr.Get(0, new OcrOptions());
+        UntilComplete(earlySelection);
+        Check(earlySelection.Result?.Text.Contains("PaperDesk") == true, "mouse release before OCR readiness waits for recognition");
+        Check(cached?.Text.Contains("Проверка") == true && workspace.CanInteract, "stable visible scan is recognized automatically without blocking UI");
+        Check(scanTab.Ocr.Get(1, new OcrOptions()) is null, "off-screen page is not recognized speculatively");
+        Check(ReferenceEquals(scanPageItem, workspace.Pages[0]) && !workspace.Document!.IsDirty && !workspace.Document.CanUndo, "automatic OCR preserves page items and PDF edit state");
+        var pickedText = workspace.SelectPageTextAsync(scanPageItem, new Point(.102, .241), new Point(.30, .241));
+        UntilComplete(pickedText);
+        Check(pickedText.Result.Text.Contains("PaperDesk"), "view model selects OCR text from memory");
+        var liveSelection = scanControl.UpdateTextSelectionAsync(new Point(.08, .241), new Point(.8, .241));
+        UntilComplete(liveSelection);
+        Check(liveSelection.Result?.Text.Contains("PaperDesk document test") == true && System.Windows.Input.ApplicationCommands.Copy.CanExecute(null, scanControl), "live drag highlights copyable text before mouse release");
+        SaveWindow(window, Path.Combine(output, "ocr-live-selection.png"));
+        var finalSelection = scanControl.UpdateTextSelectionAsync(new Point(.08, .241), new Point(.8, .241), final: true);
+        UntilComplete(finalSelection);
+        var previousClipboard = Clipboard.ContainsText() ? Clipboard.GetText() : null;
+        try
+        {
+            System.Windows.Input.ApplicationCommands.Copy.Execute(null, scanControl);
+            var clipboardDeadline = DateTime.UtcNow.AddSeconds(3);
+            while (workspace.Status != "Выделенный текст скопирован" && DateTime.UtcNow < clipboardDeadline) Pump(25);
+            Check(Clipboard.GetText().Contains("PaperDesk document test"), "page copy command writes selected OCR text to Windows clipboard");
+        }
+        finally { if (previousClipboard is not null) Clipboard.SetText(previousClipboard); }
+        Check(scanControl.ContextMenu.Items.OfType<System.Windows.Controls.MenuItem>().Any(m => m.Command == System.Windows.Input.ApplicationCommands.Copy && m.CommandTarget == scanControl), "selection context menu routes Copy to its page");
+        Check(workspace.OcrStatus.Contains("готов"), "status bar exposes OCR readiness");
+        SaveWindow(window, Path.Combine(output, "ocr-background.png"));
+        workspace.CurrentPage = 2;
+        Pump(PdfPageControl.OcrIdleMilliseconds / 3);
+        workspace.CurrentPage = 1;
+        Pump(PdfPageControl.OcrIdleMilliseconds + 200);
+        Check(scanTab.Ocr.Get(1, new OcrOptions()) is null, "quickly passing a page does not start OCR");
+        Check(ReferenceEquals(cached, scanTab.Ocr.Get(0, new OcrOptions())), "scrolling back uses existing recognition");
+        workspace.CurrentPage = 2;
+        ocrDeadline = DateTime.UtcNow.AddSeconds(30);
+        while (scanTab.Ocr.Get(1, new OcrOptions()) is null && DateTime.UtcNow < ocrDeadline) Pump(50);
+        Check(scanTab.Ocr.Get(1, new OcrOptions())?.Text.Contains("PaperDesk") == true, "next stable viewed page is recognized automatically");
+        Check(!workspace.Document!.IsDirty, "scrolling and automatic OCR never dirty the document");
         UntilComplete(workspace.CloseTabAsync(workspace.ActiveTab!));
-
+        Throws<ObjectDisposedException>(() => scanTab.Ocr.Get(0, new OcrOptions()), "closing tab discards OCR cache");
         UntilComplete(workspace.OpenPathAsync(Path.Combine(output, "sample.pdf")));
         Pump(900);
         Check(workspace.HasDocument && workspace.Pages.Count == 2, "WPF document workspace");
-        var ocrDialog = new PDF_Reader.Views.OcrWindow(workspace, new SettingsService(Path.Combine(output, "ocr-ui-settings.json"))) { Owner = window, ShowActivated = false };
-        ocrDialog.Show(); Pump(100); SaveWindow(ocrDialog, Path.Combine(output, "ocr-dialog.png")); ocrDialog.Close();
         workspace.FitWidthCommand.Execute(null);
         Pump(900);
         SaveWindow(window, Path.Combine(output, "workspace.png"));

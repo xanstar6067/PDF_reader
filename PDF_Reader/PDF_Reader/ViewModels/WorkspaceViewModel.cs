@@ -39,6 +39,58 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
     public event Action? FindRequested;
     public event Action? PrintRequested;
     public event Action? DefaultAppRequested;
+    public event Action? OcrSettingsChanged;
+
+    public bool BackgroundOcrEnabled => _settings.Value.Ocr.Enabled;
+    public string OcrStatus => !HasDocument ? "" : !BackgroundOcrEnabled ? "OCR: отключено"
+        : Info?.CanCopy != true ? "Копирование запрещено" : Pages.ElementAtOrDefault(CurrentPage - 1)?.OcrStatus ?? "";
+
+    internal long SetOcrStatus(PageItem page, string status)
+    {
+        page.OcrStatus = status;
+        page.OcrStatusVersion++;
+        if (Document == page.Document && CurrentPage == page.Number) Notify(nameof(OcrStatus));
+        return page.OcrStatusVersion;
+    }
+
+    public void ResetOcr()
+    {
+        foreach (var tab in Documents) tab.Ocr.Clear();
+        OcrSettingsChanged?.Invoke();
+        Notify(nameof(OcrStatus));
+    }
+
+    internal async Task PrepareVisibleOcrAsync(PageItem page, CancellationToken cancellation)
+    {
+        if (!BackgroundOcrEnabled || !CanInteract || Info?.CanCopy != true || ActiveTab is not { } tab || tab.Document != page.Document) return;
+        var generation = SetOcrStatus(page, "OCR: распознавание…");
+        try
+        {
+            var result = await tab.Ocr.EnsureAsync(page.Info.Index, _settings.Value.Ocr, cancellation);
+            cancellation.ThrowIfCancellationRequested();
+            if (page.OcrStatusVersion == generation)
+                SetOcrStatus(page, result is null ? "Текст готов к копированию" : result.Text.Length > 0 ? "OCR: текст готов к копированию" : "OCR: текст не найден");
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            if (page.OcrStatusVersion == generation) SetOcrStatus(page, "OCR: ошибка — " + ex.Message);
+            throw;
+        }
+    }
+
+    internal async Task<TextSelection> SelectPageTextAsync(PageItem page, Point from, Point to)
+    {
+        if (Document != page.Document || ActiveTab is not { } tab) return new("", []);
+        var revision = page.Document.Revision;
+        var options = _settings.Value.Ocr;
+        var selection = await Task.Run(() =>
+        {
+            var native = page.Document.SelectText(page.Info.Index, from, to);
+            return !string.IsNullOrEmpty(native.Text) ? native : tab.Ocr.Get(page.Info.Index, options)?.Select(from, to) ?? native;
+        });
+        return Document == page.Document && page.Document.Revision == revision ? selection : new("", []);
+    }
 
     public ObservableCollection<DocumentTab> Documents { get; } = [];
     public ObservableCollection<PageItem> Pages { get; } = [];
@@ -101,6 +153,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
             var page = Math.Clamp(value, 1, Math.Max(1, PageCount));
             if (!Set(ref _currentPage, page)) return;
             if (ActiveTab is not null) ActiveTab.LastPage = page;
+            Notify(nameof(OcrStatus));
             NavigateRequested?.Invoke(page - 1);
             CommandManager.InvalidateRequerySuggested();
         }
@@ -111,6 +164,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
         if (index < 0 || index >= PageCount) return;
         if (!Set(ref _currentPage, index + 1, nameof(CurrentPage))) return;
         if (ActiveTab is not null) ActiveTab.LastPage = _currentPage;
+        Notify(nameof(OcrStatus));
         CommandManager.InvalidateRequerySuggested();
     }
 
@@ -427,7 +481,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
             Status = "Откройте PDF, чтобы начать работу";
         }
         foreach (var name in new[] { nameof(HasDocument), nameof(CanInteract), nameof(Document), nameof(PageCount), nameof(CurrentPage),
-                     nameof(WindowTitle), nameof(Info), nameof(DocumentSummary), nameof(SearchSummary) })
+                     nameof(WindowTitle), nameof(Info), nameof(DocumentSummary), nameof(SearchSummary), nameof(OcrStatus) })
             Notify(name);
         CommandManager.InvalidateRequerySuggested();
         if (HasDocument && changedPage is null) NavigateRequested?.Invoke(CurrentPage - 1);
@@ -601,24 +655,6 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
         if (!string.IsNullOrWhiteSpace(Query)) QueueSearch();
     }
 
-    public async Task<OcrSummary> RecognizeAsync(int[] pages, OcrOptions options, IProgress<OcrProgress> progress, CancellationToken cancellation)
-    {
-        if (!CanInteract || Document is not { } document) throw new InvalidOperationException("Документ занят.");
-        CancelSearch();
-        OcrSummary? result = null;
-        await BusyAsync("Распознавание текста…", async () =>
-        {
-            try { result = await Task.Run(() => OcrService.RecognizeAsync(document, pages, options, progress, cancellation), cancellation); }
-            finally
-            {
-                // Each completed page is a transaction. Refresh even after cancellation or a later page's failure.
-                await RefreshAsync(pages.Length == 1 ? pages[0] : null);
-            }
-        });
-        if (!string.IsNullOrWhiteSpace(Query)) QueueSearch();
-        return result!;
-    }
-
     private async Task MovePageAsync(int direction)
     {
         var from = CurrentPage - 1;
@@ -662,11 +698,20 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
     private async Task CopyPageTextAsync()
     {
         var document = Document!;
+        var tab = ActiveTab!;
+        var revision = document.Revision;
         var index = CurrentPage - 1;
         var text = await Task.Run(() => document.ExtractText(index));
+        if (string.IsNullOrWhiteSpace(text) && BackgroundOcrEnabled)
+        {
+            Status = "Распознавание текста страницы…";
+            var result = await tab.Ocr.EnsureAsync(index, _settings.Value.Ocr, CancellationToken.None);
+            text = result?.Text ?? "";
+        }
+        if (Document != document || document.Revision != revision || CurrentPage - 1 != index) return;
         if (string.IsNullOrWhiteSpace(text))
         {
-            Status = "На странице нет текстового слоя. Для скана требуется OCR.";
+            Status = BackgroundOcrEnabled ? "На странице не найден текст для копирования." : "На странице нет текстового слоя. Включите фоновое OCR в меню «Документ».";
             return;
         }
         Clipboard.SetText(text);

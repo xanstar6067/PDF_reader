@@ -2,6 +2,7 @@ namespace PDF_Reader.Models;
 
 public sealed record OcrOptions
 {
+    public bool Enabled { get; set; } = true;
     public string[] Languages { get; set; } = ["rus", "eng"];
     public int Dpi { get; set; } = 300;
     public int PageSegmentation { get; set; } = 3;
@@ -19,6 +20,3 @@ public sealed record OcrOptions
     public static bool IsLanguageCode(string? code) => code is { Length: > 0 and <= 64 } && char.IsAsciiLetter(code[0]) &&
         code.All(c => char.IsAsciiLetterOrDigit(c) || c == '_') && code is not ("osd" or "equ");
 }
-
-public sealed record OcrSummary(int Recognized, int Skipped, int Empty);
-public sealed record OcrProgress(int Completed, int Total, string Message);

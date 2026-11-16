@@ -45,6 +45,8 @@ internal static class Pdfium
     [DllImport(Dll)] internal static extern nint FPDFText_LoadPage(nint page);
     [DllImport(Dll)] internal static extern void FPDFText_ClosePage(nint textPage);
     [DllImport(Dll)] internal static extern int FPDFText_CountChars(nint textPage);
+    [DllImport(Dll)] internal static extern uint FPDFText_GetUnicode(nint textPage, int index);
+    [DllImport(Dll)] internal static extern int FPDFText_GetCharBox(nint textPage, int index, out double left, out double right, out double bottom, out double top);
     [DllImport(Dll)] internal static extern int FPDFText_GetText(nint textPage, int start, int count, byte[] text);
     [DllImport(Dll)] internal static extern int FPDFText_GetCharIndexAtPos(nint textPage, double x, double y, double tx, double ty);
     [DllImport(Dll)] internal static extern nint FPDFText_GetTextObject(nint textPage, int index);
@@ -77,6 +79,8 @@ internal static class Pdfium
     [DllImport(Dll)] internal static extern int FPDFPage_CountObjects(nint page);
     [DllImport(Dll)] internal static extern nint FPDFPage_GetObject(nint page, int index);
     [DllImport(Dll)] internal static extern int FPDFPageObj_GetType(nint obj);
+    [DllImport(Dll)] internal static extern int FPDFFormObj_CountObjects(nint obj);
+    [DllImport(Dll)] internal static extern nint FPDFFormObj_GetObject(nint obj, uint index);
     [DllImport(Dll)] internal static extern int FPDFPageObj_GetBounds(nint obj, out float left, out float bottom, out float right, out float top);
     [DllImport(Dll)] internal static extern int FPDFPageObj_GetMatrix(nint obj, out Matrix matrix);
     [DllImport(Dll)] internal static extern int FPDFPageObj_SetMatrix(nint obj, ref Matrix matrix);
@@ -101,9 +105,6 @@ internal static class Pdfium
     [DllImport(Dll)] internal static extern nint FPDFText_LoadFont(nint document, byte[] data, uint size, int type, int cid);
     [DllImport(Dll)] internal static extern void FPDFFont_Close(nint font);
     [DllImport(Dll)] internal static extern int FPDF_ImportPages(nint document, nint source, [MarshalAs(UnmanagedType.LPUTF8Str)] string? range, int index);
-    [DllImport(Dll)] internal static extern nint FPDF_NewXObjectFromPage(nint destination, nint source, int index);
-    [DllImport(Dll)] internal static extern nint FPDF_NewFormObjectFromXObject(nint xobject);
-    [DllImport(Dll)] internal static extern void FPDF_CloseXObject(nint xobject);
 
     [DllImport(Dll)] internal static extern nint FPDFPage_CreateAnnot(nint page, int type);
     [DllImport(Dll)] internal static extern int FPDFPage_GetAnnotCount(nint page);
