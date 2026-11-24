@@ -23,4 +23,8 @@ internal sealed class OcrPage
     {
         return _map.Select(from, to);
     }
+
+    internal IReadOnlyList<SearchMatch> Search(int index, string query, bool matchCase, bool wholeWord,
+        IReadOnlyList<SearchMatch> nativeMatches, int limit, CancellationToken cancellation) =>
+        _map.Search(index, query, matchCase, wholeWord, nativeMatches, limit, cancellation);
 }

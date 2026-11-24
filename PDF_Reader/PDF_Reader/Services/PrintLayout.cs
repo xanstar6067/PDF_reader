@@ -44,6 +44,7 @@ internal static class PrintLayout
             throw new ArgumentException("Некорректная область печати.");
         if (pages.Length == 0 || pages.Any(p => p < 0 || p >= info.Count)) throw new ArgumentException("Некорректные страницы для печати.");
         if (!double.IsFinite(options.ScalePercent) || options.ScalePercent is < 10 or > 1000) throw new ArgumentException("Масштаб должен быть от 10 до 1000 %.");
+        if (options.RasterDpi is < 1 or > 600) throw new ArgumentException("Качество печати должно быть от 1 до 600 DPI.");
         if (options.Columns is < 1 or > 8 || options.Rows is < 1 or > 8) throw new ArgumentException("Сетка должна быть от 1 до 8 строк и столбцов.");
         var content = area;
         if (options.Mode == PrintMode.Poster)

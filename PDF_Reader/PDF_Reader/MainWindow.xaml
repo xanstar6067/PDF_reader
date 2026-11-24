@@ -45,6 +45,7 @@
                     <MenuItem Header="_Файл">
                         <MenuItem Header="Новый документ" Command="{Binding NewCommand}" InputGestureText="Ctrl+N"/>
                         <MenuItem Header="Открыть…" Command="{Binding OpenCommand}" InputGestureText="Ctrl+O"/>
+                        <MenuItem Header="Объединить PDF…" Command="{Binding CombineCommand}"/>
                         <Separator/>
                         <MenuItem Header="Сохранить" Command="{Binding SaveCommand}" InputGestureText="Ctrl+S"/>
                         <MenuItem Header="Сохранить как…" Command="{Binding SaveAsCommand}" InputGestureText="Ctrl+Shift+S"/>
@@ -86,12 +87,13 @@
                     </MenuItem>
                     <MenuItem Header="_Документ">
                         <MenuItem Header="Настройки OCR и языки…" Click="OcrSettings_Click" IsEnabled="{Binding IsBusy, Converter={StaticResource Not}}"/>
+                        <MenuItem Header="Распознать страницы и сохранить копию…" Command="{Binding SaveSearchableCopyCommand}"/>
                         <Separator/>
-                        <MenuItem Header="Повернуть страницу" Command="{Binding RotateCommand}"/>
+                        <MenuItem Header="Повернуть выбранные страницы" Command="{Binding RotateCommand}"/>
                         <MenuItem Header="Добавить страницу" Command="{Binding InsertPageCommand}"/>
                         <MenuItem Header="Вставить из PDF…" Command="{Binding ImportCommand}"/>
                         <MenuItem Header="Извлечь страницы…" Command="{Binding ExportCommand}"/>
-                        <MenuItem Header="Удалить страницу" Command="{Binding DeletePageCommand}"/>
+                        <MenuItem Header="Удалить выбранные страницы" Command="{Binding DeletePageCommand}"/>
                     </MenuItem>
                     <MenuItem Header="_Справка">
                         <MenuItem Header="Горячие клавиши" Click="Help_Click"/>
@@ -228,7 +230,11 @@
                 <TabControl SelectedIndex="{Binding NavigationTab}" BorderThickness="0" Background="{DynamicResource Surface}" Padding="0">
                     <TabItem Header="Стр.">
                         <ListBox x:Name="ThumbnailList" ItemsSource="{Binding Pages}" BorderThickness="0" Background="{DynamicResource Subtle}"
-                                 SelectionChanged="Thumbnails_SelectionChanged"
+                                 SelectionMode="Extended" SelectionChanged="Thumbnails_SelectionChanged" AllowDrop="True" IsEnabled="{Binding CanInteract}"
+                                 PreviewMouseLeftButtonDown="Thumbnails_MouseDown" PreviewMouseLeftButtonUp="Thumbnails_MouseUp"
+                                 PreviewMouseMove="Thumbnails_MouseMove" DragOver="Thumbnails_DragOver"
+                                 DragLeave="Thumbnails_DragLeave" Drop="Thumbnails_Drop"
+                                 ToolTip="Ctrl добавляет отдельную страницу, Shift выделяет диапазон. Перетащите выбранные страницы, чтобы изменить порядок."
                                  ScrollViewer.CanContentScroll="True"
                                  VirtualizingPanel.IsVirtualizing="True"
                                  VirtualizingPanel.VirtualizationMode="Recycling"
@@ -281,7 +287,8 @@
                             <TextBox x:Name="SearchBox" Text="{Binding Query, UpdateSourceTrigger=PropertyChanged}" ToolTip="Поиск по всему документу"/>
                             <StackPanel Grid.Row="1" Margin="0,12,0,8">
                                 <CheckBox Content="Учитывать регистр" IsChecked="{Binding MatchCase}" Margin="0,0,0,8"/>
-                                <CheckBox Content="Слово целиком" IsChecked="{Binding WholeWord}"/>
+                                <CheckBox Content="Слово целиком" IsChecked="{Binding WholeWord}" Margin="0,0,0,8"/>
+                                <CheckBox Content="Искать по сканам (OCR)" IsChecked="{Binding SearchScans}" IsEnabled="{Binding CanSearchScans}"/>
                             </StackPanel>
                             <DockPanel Grid.Row="2" Margin="0,4,0,12">
                                 <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
@@ -371,6 +378,8 @@
                                                   Match="{Binding DataContext.SelectedMatch, RelativeSource={RelativeSource AncestorType=Window}}"
                                                   MatchesVersion="{Binding DataContext.MatchesVersion, RelativeSource={RelativeSource AncestorType=Window}}"
                                                   SelectedAnnotation="{Binding DataContext.SelectedAnnotation, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                  Measurement="{Binding Measurement}"
+                                                  MeasurementMode="{Binding DataContext.IsMeasuring, RelativeSource={RelativeSource AncestorType=Window}}"
                                                   Workspace="{Binding DataContext, RelativeSource={RelativeSource AncestorType=Window}}"/>
                                 <Button Content="Открыть 3D-просмотр…" Tag="{Binding}" Click="Open3D_Click" HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="12">
                                     <Button.Style><Style TargetType="Button" BasedOn="{StaticResource AccentButton}"><Setter Property="Visibility" Value="Collapsed"/><Style.Triggers><DataTrigger Binding="{Binding Info.Has3D}" Value="True"><Setter Property="Visibility" Value="Visible"/></DataTrigger></Style.Triggers></Style></Button.Style>
@@ -388,6 +397,13 @@
                 <ScrollViewer VerticalScrollBarVisibility="Auto">
                     <StackPanel Margin="18,22">
                         <TextBlock Text="Инструменты" FontSize="16" FontWeight="SemiBold" Margin="9,0,0,6"/>
+                        <ToggleButton Style="{StaticResource ToolButton}" IsEnabled="{Binding CanInteract}"
+                                      IsChecked="{Binding Tool, Converter={StaticResource EnumMatch}, ConverterParameter=Measure}"
+                                      Content="Измерить расстояние"/>
+                        <WrapPanel Margin="8,4,0,8" Visibility="{Binding IsMeasuring, Converter={StaticResource Visible}}">
+                            <Button Content="Задать длину…" Command="{Binding CalibrateMeasurementCommand}" Padding="7,5" Margin="0,0,4,4"/>
+                            <Button Content="Сбросить масштаб" Command="{Binding ResetMeasurementScaleCommand}" Padding="7,5" Margin="0,0,0,4"/>
+                        </WrapPanel>
                         <TextBlock Text="Текст" Style="{StaticResource PanelHeader}"/>
                         <ToggleButton Style="{StaticResource ToolButton}" IsEnabled="{Binding CanInteract}"
                                       IsChecked="{Binding Tool, Converter={StaticResource EnumMatch}, ConverterParameter=Select}">
@@ -513,7 +529,7 @@
                             <Button Content="Выше" Command="{Binding MovePageUpCommand}" Padding="12,7" Margin="0,0,8,0"/>
                             <Button Content="Ниже" Command="{Binding MovePageDownCommand}" Padding="12,7"/>
                         </StackPanel>
-                        <Button Content="Удалить страницу" Command="{Binding DeletePageCommand}" Style="{StaticResource ToolbarButton}"
+                        <Button Content="Удалить выбранные страницы" Command="{Binding DeletePageCommand}" Style="{StaticResource ToolbarButton}"
                                 HorizontalContentAlignment="Left" Foreground="{DynamicResource Danger}"/>
                         <Border Background="{DynamicResource Subtle}" CornerRadius="8" Padding="13" Margin="4,25,4,0">
                             <TextBlock Text="{Binding ToolHint}" TextWrapping="Wrap" Foreground="{DynamicResource Muted}" FontSize="12"/>
@@ -595,7 +611,9 @@
                            VerticalAlignment="Center" Margin="20,0,0,0"/>
                 <TextBlock DockPanel.Dock="Right" Text="{Binding OcrStatus}" ToolTip="{Binding OcrStatus}" Foreground="{DynamicResource Muted}" FontSize="11"
                            MaxWidth="360" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" Margin="16,0,0,0"/>
-                <TextBlock Text="{Binding Status}" Foreground="{DynamicResource Muted}" FontSize="11" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+                <Button DockPanel.Dock="Right" Content="Отменить OCR" Command="{Binding CancelOcrExportCommand}" Padding="8,2" Margin="8,0"
+                        Visibility="{Binding IsOcrExporting, Converter={StaticResource Visible}}"/>
+                <TextBlock Text="{Binding Status}" ToolTip="{Binding Status}" Foreground="{DynamicResource Muted}" FontSize="11" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
             </DockPanel>
         </Border>
         <ProgressBar Grid.Row="3" Height="3" VerticalAlignment="Top" IsIndeterminate="True" Foreground="{DynamicResource Accent}"

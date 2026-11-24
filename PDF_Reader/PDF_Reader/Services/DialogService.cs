@@ -7,6 +7,7 @@ namespace PDF_Reader.Services;
 public interface IUserDialogs
 {
     string[] ChooseOpenFiles();
+    string[] OrderPageSources(string[] paths);
     string? ChooseSaveFile(string suggestedName);
     string? AskText(string title, string description, string value = "", bool multiline = false, bool password = false);
     (string Text, float Size)? EditText(string title, string description, string value, float fontSize, bool multiline);
@@ -22,6 +23,12 @@ public sealed class DialogService(Func<Window> owner) : IUserDialogs
     {
         var dialog = new OpenFileDialog { Filter = "PDF документы (*.pdf)|*.pdf", Multiselect = true, CheckFileExists = true, Title = "Открыть PDF" };
         return dialog.ShowDialog(owner()) == true ? dialog.FileNames : [];
+    }
+
+    public string[] OrderPageSources(string[] paths)
+    {
+        var dialog = new PageSourcesWindow(paths) { Owner = owner() };
+        return dialog.ShowDialog() == true ? dialog.Paths : [];
     }
 
     public string? ChooseSaveFile(string suggestedName)

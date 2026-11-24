@@ -12,8 +12,7 @@ namespace PDF_Reader.Services;
 
 public static class PrintService
 {
-    private const double PrintDpi = 200;
-
+    private const long MaxSheetPixels = 44_000_000;
     public static async Task<bool> PrintAsync(Window owner, PdfDocument document, int currentPage, PrintScaling scaling, Action<string> progress)
     {
         using var copy = await Task.Run(document.CreateCopy);
@@ -71,7 +70,8 @@ public static class PrintService
     internal static Placement Place(PdfPageInfo page, Rect area, PrintScaling scaling)
     {
         var slot = PrintLayout.Fit(page, area, scaling, 100, true);
-        return new(slot.PageIndex, slot.Size.Width, slot.Size.Height, slot.Rotated, slot.Center, (int)Math.Ceiling(slot.Size.Width * PrintDpi / 96));
+        return new(slot.PageIndex, slot.Size.Width, slot.Size.Height, slot.Rotated, slot.Center,
+            (int)Math.Ceiling(slot.Size.Width * PrintOptions.DefaultRasterDpi / 96));
     }
 
     private sealed record SlotImage(BitmapSource Image, Rect Bounds, Matrix Transform, Rect Clip);
@@ -87,6 +87,8 @@ public static class PrintService
     private static SlotImage[] RenderSheet(PdfDocument document, PrintSheet sheet, PrintOptions options, double dpi, CancellationToken cancellation)
     {
         var images = new List<SlotImage>();
+        var clipArea = sheet.Slots.Sum(slot => slot.Clip.Width * slot.Clip.Height);
+        var sheetFactor = Math.Min(dpi / 96, Math.Sqrt(MaxSheetPixels / clipArea));
         foreach (var slot in sheet.Slots)
         {
             cancellation.ThrowIfCancellationRequested();
@@ -97,8 +99,7 @@ public static class PrintService
             visible.Intersect(new Rect(slot.Size));
             if (visible.IsEmpty || visible.Width <= 0 || visible.Height <= 0) continue;
             // Render only the visible PDF region, preserving poster detail without a full A1/A0 raster.
-            var factor = Math.Min(dpi / 96, (PdfDocument.MaxRenderSide - 1) / Math.Max(slot.Size.Width, slot.Size.Height));
-            factor = Math.Min(factor, Math.Sqrt((PdfDocument.MaxRenderPixels - 100000) / (visible.Width * visible.Height)));
+            var factor = Math.Min(sheetFactor, (PdfDocument.MaxRenderSide - 1) / Math.Max(slot.Size.Width, slot.Size.Height));
             var fullWidth = Math.Max(1, (int)Math.Ceiling(slot.Size.Width * factor));
             var fullHeight = Math.Max(1, (int)Math.Ceiling(slot.Size.Height * factor));
             var sx = fullWidth / slot.Size.Width;
@@ -107,7 +108,6 @@ public static class PrintService
             var y = Math.Clamp((int)Math.Floor(visible.Top * sy), 0, fullHeight - 1);
             var right = Math.Clamp((int)Math.Ceiling(visible.Right * sx), x + 1, fullWidth);
             var bottom = Math.Clamp((int)Math.Ceiling(visible.Bottom * sy), y + 1, fullHeight);
-            BitmapSource image;
             if (document.Contains3D(slot.PageIndex))
             {
                 // The same default 3D view used on the page, cropped to the print slot.
@@ -115,16 +115,34 @@ public static class PrintService
                 var crop = new Int32Rect(Math.Clamp((int)(x * (double)full.PixelWidth / fullWidth),0,full.PixelWidth-1), Math.Clamp((int)(y * (double)full.PixelHeight / fullHeight),0,full.PixelHeight-1),
                     Math.Max(1,(int)Math.Ceiling((right-x)*(double)full.PixelWidth/fullWidth)),Math.Max(1,(int)Math.Ceiling((bottom-y)*(double)full.PixelHeight/fullHeight)));
                 crop.Width = Math.Min(crop.Width,full.PixelWidth-crop.X);crop.Height = Math.Min(crop.Height,full.PixelHeight-crop.Y);
-                var cropped = new CroppedBitmap(full,crop);cropped.Freeze();image=cropped;
+                var cropped = new CroppedBitmap(full,crop);cropped.Freeze();
+                AddImage(cropped, y, bottom);
             }
-            else image = document.RenderRegion(slot.PageIndex, fullWidth, fullHeight, new Int32Rect(x, y, right - x, bottom - y), cancellation, printing: true);
-            if (options.Grayscale)
+            else
             {
-                var gray = new FormatConvertedBitmap(image, PixelFormats.Gray8, null, 0);
-                gray.Freeze();
-                image = gray;
+                // Use overlapping bands so 600 DPI fits on ordinary sheets within PDFium's per-raster limit.
+                const int overlap = 2;
+                var rows = (int)(PdfDocument.MaxRenderPixels / (right - x)) - 2 * overlap;
+                for (var start = y; start < bottom; start += rows)
+                {
+                    var top = Math.Max(y, start - overlap);
+                    var end = Math.Min(bottom, start + rows + overlap);
+                    var image = document.RenderRegion(slot.PageIndex, fullWidth, fullHeight,
+                        new Int32Rect(x, top, right - x, end - top), cancellation, printing: true);
+                    AddImage(image, top, end);
+                }
             }
-            images.Add(new(image, new Rect(x / sx, y / sy, (right - x) / sx, (bottom - y) / sy), matrix, slot.Clip));
+
+            void AddImage(BitmapSource image, int top, int end)
+            {
+                if (options.Grayscale)
+                {
+                    var gray = new FormatConvertedBitmap(image, PixelFormats.Gray8, null, 0);
+                    gray.Freeze();
+                    image = gray;
+                }
+                images.Add(new(image, new Rect(x / sx, top / sy, (right - x) / sx, (end - top) / sy), matrix, slot.Clip));
+            }
         }
         return images.ToArray();
     }
@@ -142,9 +160,13 @@ public static class PrintService
             dc.DrawImage(image.Image, image.Bounds);
             dc.Pop();
             dc.Pop();
-            if (plan.Options.PageBorder) dc.DrawRectangle(null, new Pen(Brushes.Black, .5), image.Clip);
         }
         var sheet = plan.Sheets[index];
+        if (plan.Options.PageBorder)
+        {
+            var border = new Pen(Brushes.Black, .5);
+            foreach (var slot in sheet.Slots) dc.DrawRectangle(null, border, slot.Clip);
+        }
         if (plan.Options.Mode == PrintMode.Poster)
         {
             var area = plan.ContentArea;
@@ -209,14 +231,15 @@ public static class PrintService
         private Task<SlotImage[]> Request(int index)
         {
             if (!_renders.TryGetValue(index, out var task))
-                _renders[index] = task = Task.Run(() => RenderSheet(document, plan.Sheets[index], plan.Options, PrintDpi, CancellationToken.None));
+                _renders[index] = task = Task.Run(() => RenderSheet(document, plan.Sheets[index], plan.Options, plan.Options.RasterDpi, CancellationToken.None));
             return task;
         }
 
         public override DocumentPage GetPage(int pageNumber)
         {
             if (pageNumber < 0 || pageNumber >= PageCount) return DocumentPage.Missing;
-            for (var next = pageNumber; next < Math.Min(PageCount, pageNumber + 2); next++) Request(next);
+            var prefetch = plan.Options.RasterDpi > 300 ? 1 : 2;
+            for (var next = pageNumber; next < Math.Min(PageCount, pageNumber + prefetch); next++) Request(next);
             try
             {
                 var images = _renders[pageNumber].GetAwaiter().GetResult();

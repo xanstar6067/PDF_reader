@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using System.Windows;
 using PDF_Reader.Models;
 
@@ -23,15 +24,58 @@ internal sealed class PdfTextMap(string text, PdfTextMap.Glyph[] glyphs, bool ve
         var a = Caret(first, from); var b = Caret(last, to);
         var start = Math.Min(a, b); var end = Math.Max(a, b);
         if (start == end) return new("", []);
-        var rectangles = new List<Rect>();
-        foreach (var glyph in glyphs)
+        return new(Text[start..end], GetRectangles(start, end));
+    }
+
+    internal IReadOnlyList<SearchMatch> Search(int index, string query, bool matchCase, bool wholeWord,
+        IReadOnlyList<SearchMatch> nativeMatches, int limit, CancellationToken cancellation)
+    {
+        var terms = query.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        if (terms.Length == 0 || limit <= 0) return [];
+        var pattern = string.Join(@"\s+", terms.Select(Regex.Escape));
+        if (wholeWord) pattern = @"(?<![\p{L}\p{M}\p{N}_])" + pattern + @"(?![\p{L}\p{M}\p{N}_])";
+        var options = RegexOptions.CultureInvariant | (matchCase ? RegexOptions.None : RegexOptions.IgnoreCase);
+        var results = new List<SearchMatch>();
+        var nativeRects = nativeMatches.SelectMany(match => match.Rectangles).ToArray();
+        foreach (Match hit in Regex.Matches(Text, pattern, options, TimeSpan.FromSeconds(2)))
         {
-            if (glyph.Start < start || glyph.Start >= end) continue;
-            var rect = glyph.Bounds;
+            cancellation.ThrowIfCancellationRequested();
+            var rectangles = GetRectangles(hit.Index, hit.Index + hit.Length);
+            if (rectangles.Count == 0 || rectangles.All(rect => nativeRects.Any(native => SubstantiallyOverlaps(rect, native)))) continue;
+            var start = Math.Max(0, hit.Index - 35);
+            var length = Math.Min(Text.Length - start, hit.Index - start + hit.Length + 50);
+            var preview = Text.Substring(start, length).Replace('\r', ' ').Replace('\n', ' ');
+            results.Add(new(index, hit.Index, hit.Length, preview, rectangles));
+            if (results.Count == limit) break;
+        }
+        return results;
+    }
+
+    private static bool SubstantiallyOverlaps(Rect first, Rect second)
+    {
+        var intersection = Rect.Intersect(first, second);
+        return !intersection.IsEmpty && intersection.Width * intersection.Height >=
+            Math.Min(first.Width * first.Height, second.Width * second.Height) * .55;
+    }
+
+    private List<Rect> GetRectangles(int start, int end)
+    {
+        var first = 0;
+        var last = glyphs.Length;
+        while (first < last)
+        {
+            var middle = (first + last) / 2;
+            if (glyphs[middle].Start + glyphs[middle].Length <= start) first = middle + 1;
+            else last = middle;
+        }
+        var rectangles = new List<Rect>();
+        for (var i = first; i < glyphs.Length && glyphs[i].Start < end; i++)
+        {
+            var rect = glyphs[i].Bounds;
             if (rectangles.Count > 0 && SameLine(rectangles[^1], rect)) rectangles[^1] = Rect.Union(rectangles[^1], rect);
             else rectangles.Add(rect);
         }
-        return new(Text[start..end], rectangles);
+        return rectangles;
     }
 
     private int Nearest(Point point)

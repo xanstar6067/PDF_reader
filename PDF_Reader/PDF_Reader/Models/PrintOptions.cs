@@ -11,6 +11,7 @@ public enum BookletSide { Both, Front, Back }
 /// <summary>Application layout settings; distances are millimetres, scales are percentages.</summary>
 public sealed record PrintOptions
 {
+    internal const int DefaultRasterDpi = 200;
     public PrintMode Mode { get; init; }
     public PrintScaling Scaling { get; init; } = PrintScaling.Fit;
     public double ScalePercent { get; init; } = 100;
@@ -27,4 +28,5 @@ public sealed record PrintOptions
     public BookletSide BookletSide { get; init; }
     public bool RightBinding { get; init; }
     public bool Grayscale { get; init; }
+    public int RasterDpi { get; init; } = DefaultRasterDpi;
 }

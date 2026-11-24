@@ -56,6 +56,38 @@ public static class OcrService
 
     internal static async Task<OcrPage?> RecognizePageAsync(PdfDocument document, int index, OcrOptions options, CancellationToken cancellation = default)
     {
+        var bytes = await RecognizeLayerAsync(document, index, options, cancellation).ConfigureAwait(false);
+        return bytes is null ? null : new OcrPage(bytes);
+    }
+
+    internal static async Task<int> SaveSearchableCopyAsync(PdfDocument document, string path, IReadOnlyList<int> pages,
+        OcrOptions options, IProgress<(int Current, int Total)>? progress, CancellationToken cancellation)
+    {
+        using var copy = document.CopyForOcr();
+        var added = 0;
+        for (var i = 0; i < pages.Count; i++)
+        {
+            cancellation.ThrowIfCancellationRequested();
+            progress?.Report((i + 1, pages.Count));
+            var index = pages[i];
+            var bytes = await RecognizeLayerAsync(copy, index, options with { Enabled = true }, cancellation, skipPagesWithText: true).ConfigureAwait(false);
+            if (bytes is not { Length: > 0 }) continue;
+            copy.InsertOcrLayer(index, bytes);
+            added++;
+        }
+        cancellation.ThrowIfCancellationRequested();
+        if (added > 0)
+        {
+            var output = copy.GetBytes();
+            cancellation.ThrowIfCancellationRequested();
+            AtomicFile.Write(path, output);
+        }
+        return added;
+    }
+
+    private static async Task<byte[]?> RecognizeLayerAsync(PdfDocument document, int index, OcrOptions options,
+        CancellationToken cancellation, bool skipPagesWithText = false)
+    {
         options.Validate();
         options = options with { Languages = options.Languages.ToArray() };
         if (index < 0 || index >= document.PageCount) throw new ArgumentOutOfRangeException(nameof(index));
@@ -64,8 +96,7 @@ public static class OcrService
         var directory = TemporaryDirectory();
         try
         {
-            // Check permission and native text before copying language data or starting a process.
-            var input = document.PrepareOcrPage(index, options.Dpi, cancellation);
+            var input = document.PrepareOcrPage(index, options.Dpi, cancellation, skipPagesWithText);
             if (input is null) return null;
             Directory.CreateDirectory(directory);
             var data = Path.Combine(directory, "tessdata"); Directory.CreateDirectory(data);
@@ -83,14 +114,13 @@ public static class OcrService
             await RunWorkerAsync(directory, new(data, options), cancellation).ConfigureAwait(false);
             cancellation.ThrowIfCancellationRequested();
             if (document.Revision != input.Revision) throw new OperationCanceledException("Страница изменилась во время OCR.");
-            if (File.Exists(Path.Combine(directory, "empty"))) return new OcrPage([]);
+            if (File.Exists(Path.Combine(directory, "empty"))) return [];
             var result = Path.Combine(directory, "text.pdf");
             if (!File.Exists(result) || new FileInfo(result).Length is < 100 or > 16 * 1024 * 1024)
                 throw new InvalidDataException("Некорректный результат OCR.");
-            // This text-only PDF is an internal transport for text/geometry. It never enters the user's document.
             var bytes = await File.ReadAllBytesAsync(result, cancellation).ConfigureAwait(false);
             cancellation.ThrowIfCancellationRequested();
-            return new OcrPage(bytes);
+            return bytes;
         }
         finally { Cleanup(directory); Slots.Release(); }
     }

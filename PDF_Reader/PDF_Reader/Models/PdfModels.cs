@@ -3,7 +3,9 @@ using System.Windows.Media;
 
 namespace PDF_Reader.Models;
 
-public enum DocumentTool { Select, EditText, AddText, Highlight, Underline, StrikeOut, Note, Rectangle, Ellipse, Ink }
+public enum DocumentTool { Select, EditText, AddText, Highlight, Underline, StrikeOut, Note, Rectangle, Ellipse, Ink, Measure }
+
+public sealed record PageMeasurement(Point Start, Point End, double Millimetres);
 
 /// <summary>PDF annotation subtypes created by PaperDesk.</summary>
 public static class AnnotationType

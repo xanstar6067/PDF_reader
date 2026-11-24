@@ -95,7 +95,20 @@ public sealed class PdfDocument : IDisposable
         return document;
     }
 
-    public static PdfDocument Create()
+    public static PdfDocument Create() => CreateDocument(handle =>
+    {
+        var page = Pdfium.FPDFPage_New(handle, 0, 595.28, 841.89);
+        if (page == 0) throw new InvalidOperationException("Не удалось создать страницу.");
+        Pdfium.FPDF_ClosePage(page);
+    });
+
+    internal static PdfDocument CombinePages(IReadOnlyList<PdfDocument> sources)
+    {
+        if (sources.Count < 2) throw new ArgumentException("Выберите как минимум два PDF.");
+        return CreateDocument(handle => ImportInto(handle, sources, 0));
+    }
+
+    private static PdfDocument CreateDocument(Action<nint> populate)
     {
         lock (Gate)
         {
@@ -104,9 +117,7 @@ public sealed class PdfDocument : IDisposable
             if (handle == 0) throw new InvalidOperationException("Не удалось создать PDF.");
             try
             {
-                var page = Pdfium.FPDFPage_New(handle, 0, 595.28, 841.89);
-                if (page == 0) throw new InvalidOperationException("Не удалось создать страницу.");
-                Pdfium.FPDF_ClosePage(page);
+                populate(handle);
                 var document = new PdfDocument(Serialize(handle, SaveRewrite), null);
                 document._state = ++document._nextState;
                 document.Publish();
@@ -436,7 +447,7 @@ public sealed class PdfDocument : IDisposable
 
     internal sealed record OcrInput(long Revision, BitmapSource Image);
 
-    internal OcrInput? PrepareOcrPage(int index, int dpi, CancellationToken cancellation)
+    internal OcrInput? PrepareOcrPage(int index, int dpi, CancellationToken cancellation, bool skipPagesWithText = false)
     {
         lock (Gate)
         {
@@ -447,6 +458,7 @@ public sealed class PdfDocument : IDisposable
                 // Native text pages need no OCR. Mixed pages still need it for text inside their images.
                 if (OnText(page, t => !string.IsNullOrWhiteSpace(GetText(t, 0, Pdfium.FPDFText_CountChars(t)))))
                 {
+                    if (skipPagesWithText) return null;
                     var budget = 10000;
                     bool HasImage(nint obj, int depth)
                     {
@@ -468,6 +480,54 @@ public sealed class PdfDocument : IDisposable
                 var size = FitRenderSize(width, height, requested);
                 return new OcrInput(Revision, RenderBitmap(page, size.Width, size.Height, new Int32Rect(0, 0, size.Width, size.Height), false, cancellation, contentOnly: true));
             });
+        }
+    }
+
+    internal PdfDocument CopyForOcr()
+    {
+        lock (Gate)
+        {
+            RequirePermission(8 | 16, "Добавление текстового слоя запрещено настройками защиты PDF.");
+            return FromBytes(CurrentBytes(), _password);
+        }
+    }
+
+    // Used only on a private export copy. If any page fails, the copy is discarded before writing.
+    internal void InsertOcrLayer(int index, byte[] bytes)
+    {
+        lock (Gate)
+        {
+            RequirePermission(8 | 16, "Добавление текстового слоя запрещено настройками защиты PDF.");
+            using var source = FromBytes(bytes);
+            if (source.PageCount != 1) throw new InvalidDataException("Некорректный результат OCR.");
+            var size = source.OnPage(0, page => new Size(Pdfium.FPDF_GetPageWidthF(page), Pdfium.FPDF_GetPageHeightF(page)));
+            OnPage(index, page =>
+            {
+                var origin = ToPdf(page, new(0, 1));
+                var horizontal = (ToPdf(page, new(1, 1)) - origin) / size.Width;
+                var vertical = (ToPdf(page, new(0, 0)) - origin) / size.Height;
+                var matrix = new Pdfium.Matrix { A = (float)horizontal.X, B = (float)horizontal.Y,
+                    C = (float)vertical.X, D = (float)vertical.Y, E = (float)origin.X, F = (float)origin.Y };
+                var xObject = Pdfium.FPDF_NewXObjectFromPage(_handle, source._handle, 0);
+                if (xObject == 0) throw new InvalidOperationException("Не удалось импортировать слой OCR.");
+                try
+                {
+                    var form = Pdfium.FPDF_NewFormObjectFromXObject(xObject);
+                    if (form == 0) throw new InvalidOperationException("Не удалось создать слой OCR.");
+                    if (Pdfium.FPDFPageObj_SetMatrix(form, ref matrix) == 0)
+                    {
+                        Pdfium.FPDFPageObj_Destroy(form);
+                        throw new InvalidOperationException("Не удалось разместить слой OCR.");
+                    }
+                    Pdfium.FPDFPage_InsertObject(page, form);
+                    if (Pdfium.FPDFPage_GenerateContent(page) == 0)
+                        throw new InvalidOperationException("Не удалось записать слой OCR.");
+                }
+                finally { Pdfium.FPDF_CloseXObject(xObject); }
+                return 0;
+            });
+            _bufferIsCurrent = false;
+            Interlocked.Increment(ref _revision);
         }
     }
 
@@ -988,25 +1048,45 @@ public sealed class PdfDocument : IDisposable
         }));
     }
 
-    public void RotatePage(int index, int direction) => Edit(() => OnPage(index, p =>
-    {
-        Pdfium.FPDFPage_SetRotation(p, (Pdfium.FPDFPage_GetRotation(p) + direction + 4) % 4);
-        return 0;
-    }), 1024);
+    public void RotatePage(int index, int direction) => RotatePages([index], direction);
 
-    public void DeletePage(int index) => Edit(() =>
+    internal void RotatePages(int[] indices, int direction) => Edit(() =>
     {
-        if (NativePageCount <= 1) throw new InvalidOperationException("В документе должна остаться хотя бы одна страница.");
-        if (index < 0 || index >= NativePageCount) throw new ArgumentOutOfRangeException(nameof(index));
-        Pdfium.FPDFPage_Delete(_handle, index);
+        ValidatePageIndices(indices);
+        foreach (var index in indices)
+            OnPage(index, page =>
+            {
+                Pdfium.FPDFPage_SetRotation(page, (Pdfium.FPDFPage_GetRotation(page) + direction % 4 + 4) % 4);
+                return 0;
+            });
     }, 1024);
 
-    public void MovePage(int from, int to) => Edit(() =>
+    public void DeletePage(int index) => DeletePages([index]);
+
+    internal void DeletePages(int[] indices) => Edit(() =>
+    {
+        ValidatePageIndices(indices);
+        if (indices.Length == NativePageCount) throw new InvalidOperationException("В документе должна остаться хотя бы одна страница.");
+        foreach (var index in indices.OrderDescending()) Pdfium.FPDFPage_Delete(_handle, index);
+    }, 1024);
+
+    public void MovePage(int from, int to) => MovePages([from], to);
+
+    internal void MovePages(int[] indices, int to) => Edit(() =>
+    {
+        ValidatePageIndices(indices);
+        if (to < 0 || to > NativePageCount - indices.Length) throw new ArgumentOutOfRangeException(nameof(to));
+        if (Pdfium.FPDF_MovePages(_handle, indices, (uint)indices.Length, to) == 0)
+            throw new InvalidOperationException("Не удалось переместить страницы.");
+    }, 1024);
+
+    private void ValidatePageIndices(int[] indices)
     {
         var count = NativePageCount;
-        if (from < 0 || from >= count || to < 0 || to >= count) throw new ArgumentOutOfRangeException(nameof(to));
-        if (Pdfium.FPDF_MovePages(_handle, [from], 1, to) == 0) throw new InvalidOperationException("Не удалось переместить страницу.");
-    }, 1024);
+        if (indices.Any(index => index < 0 || index >= count)) throw new ArgumentOutOfRangeException(nameof(indices));
+        if (indices.Length == 0 || indices.Distinct().Count() != indices.Length)
+            throw new ArgumentException("Укажите разные страницы.", nameof(indices));
+    }
 
     public void InsertBlankPage(int index) => Edit(() =>
     {
@@ -1016,14 +1096,25 @@ public sealed class PdfDocument : IDisposable
         Pdfium.FPDF_ClosePage(page);
     }, 1024);
 
-    public void ImportPages(PdfDocument source, int index) => Edit(() =>
+    public void ImportPages(PdfDocument source, int index) => ImportPages([source], index);
+
+    internal void ImportPages(IReadOnlyList<PdfDocument> sources, int index) => Edit(() =>
     {
-        source.EnsureOpen();
-        if (ReferenceEquals(source, this)) throw new ArgumentException("Выберите другой документ.");
         if (index < 0 || index > NativePageCount) throw new ArgumentOutOfRangeException(nameof(index));
-        source.RequirePermission(16, "Копирование страниц исходного PDF запрещено.");
-        if (Pdfium.FPDF_ImportPages(_handle, source._handle, null, index) == 0) throw new InvalidOperationException("Не удалось импортировать страницы.");
+        ImportInto(_handle, sources, index);
     }, 1024);
+
+    private static void ImportInto(nint destination, IReadOnlyList<PdfDocument> sources, int index)
+    {
+        foreach (var source in sources)
+        {
+            source.RequirePermission(16, "Копирование страниц исходного PDF запрещено.");
+            if (source._handle == destination) throw new ArgumentException("Выберите другой документ.");
+            if (Pdfium.FPDF_ImportPages(destination, source._handle, null, index) == 0)
+                throw new InvalidOperationException("Не удалось импортировать страницы.");
+            index += source.NativePageCount;
+        }
+    }
 
     public byte[] ExportPages(string range)
     {

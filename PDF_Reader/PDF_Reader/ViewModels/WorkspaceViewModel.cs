@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Windows;
 using System.Windows.Input;
@@ -15,7 +16,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
     private readonly SettingsService _settings;
     private readonly RecoveryService _recovery;
     private DocumentTab? _activeTab;
-    private bool _busy, _searching, _matchCase, _wholeWord, _fitWidth, _printing, _autosaving;
+    private bool _busy, _searching, _matchCase, _wholeWord, _searchScans, _fitWidth, _printing, _autosaving;
     private int _currentPage = 1, _navigationTab, _matchesVersion;
     private double _zoom = 1, _viewportWidth = 900;
     private string _status = "Откройте PDF, чтобы начать работу", _query = "";
@@ -33,13 +34,18 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
         [DocumentTool.Ink] = Color.FromRgb(30, 136, 229)
     };
     private CancellationTokenSource? _searchCancellation;
+    private CancellationTokenSource? _ocrExportCancellation;
+    private string? _searchProgress;
+    private bool _scanSearchIncomplete;
     private Dictionary<int, List<SearchMatch>> _pageMatches = [];
+    private int[] _selectedThumbnails = [];
 
     public event Action<int>? NavigateRequested;
     public event Action? FindRequested;
     public event Action? PrintRequested;
     public event Action? DefaultAppRequested;
     public event Action? OcrSettingsChanged;
+    internal event Action<int[]>? ThumbnailSelectionRequested;
 
     public bool BackgroundOcrEnabled => _settings.Value.Ocr.Enabled;
     public string OcrStatus => !HasDocument ? "" : !BackgroundOcrEnabled ? "OCR: отключено"
@@ -58,6 +64,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
         foreach (var tab in Documents) tab.Ocr.Clear();
         OcrSettingsChanged?.Invoke();
         Notify(nameof(OcrStatus));
+        if (SearchScans && !string.IsNullOrWhiteSpace(Query)) QueueSearch();
     }
 
     internal async Task PrepareVisibleOcrAsync(PageItem page, CancellationToken cancellation)
@@ -200,7 +207,9 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
             if (!Set(ref _tool, value)) return;
             if (value != DocumentTool.Select) SelectedAnnotation = null;
             Notify(nameof(ToolHint));
+            Notify(nameof(IsMeasuring));
             Notify(nameof(CurrentColor));
+            CommandManager.InvalidateRequerySuggested();
             Status = ToolHint;
         }
     }
@@ -216,8 +225,11 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
         DocumentTool.Rectangle => "Протяните мышью, чтобы нарисовать прямоугольник",
         DocumentTool.Ellipse => "Протяните мышью, чтобы нарисовать овал",
         DocumentTool.Ink => "Рисуйте мышью с нажатой кнопкой",
+        DocumentTool.Measure => "Протяните мышью между точками. Для масштаба чертежа измерьте отрезок известной длины и нажмите «Задать длину…».",
         _ => "Выделяйте текст мышью • щелчок по аннотации выделяет её • Delete — удалить • Ctrl+колесо — масштаб"
     };
+
+    public bool IsMeasuring => Tool == DocumentTool.Measure;
 
     public static IReadOnlyList<Color> Palette { get; } =
     [
@@ -282,6 +294,9 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
     public string Query { get => _query; set { if (Set(ref _query, value)) QueueSearch(); } }
     public bool MatchCase { get => _matchCase; set { if (Set(ref _matchCase, value)) QueueSearch(); } }
     public bool WholeWord { get => _wholeWord; set { if (Set(ref _wholeWord, value)) QueueSearch(); } }
+    public bool SearchScans { get => _searchScans; set { if (Set(ref _searchScans, value)) QueueSearch(); } }
+    public bool CanSearchScans => Info?.CanCopy == true;
+    public bool IsOcrExporting => _ocrExportCancellation is not null;
 
     public SearchMatch? SelectedMatch
     {
@@ -301,9 +316,10 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
 
     public IReadOnlyList<SearchMatch> GetPageMatches(int index) => _pageMatches.TryGetValue(index, out var list) ? list : [];
 
-    public string SearchSummary => IsSearching ? "Поиск…" : string.IsNullOrWhiteSpace(Query) ? "Введите текст для поиска" :
-        Matches.Count == 0 ? "Совпадений нет" :
-        $"{(SelectedMatch is null ? 0 : Matches.IndexOf(SelectedMatch) + 1)} / {Matches.Count}{(Matches.Count == 10000 ? "+" : "")} совпадений";
+    public string SearchSummary => IsSearching ? _searchProgress ?? "Поиск…" : string.IsNullOrWhiteSpace(Query) ? "Введите текст для поиска" :
+        (Matches.Count == 0 ? "Совпадений нет" :
+        $"{(SelectedMatch is null ? 0 : Matches.IndexOf(SelectedMatch) + 1)} / {Matches.Count}{(Matches.Count == 10000 ? "+" : "")} совпадений") +
+        (_scanSearchIncomplete ? "\nПоиск по сканам не завершён" : "");
 
     public string DocumentSummary => Info is null ? "" :
         $"{Info.Pages} стр. • {(Info.IsEncrypted ? "Защищённый PDF" : "PDF документ")}" +
@@ -336,8 +352,13 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
     public ICommand MovePageDownCommand { get; }
     public ICommand InsertPageCommand { get; }
     public ICommand ImportCommand { get; }
+    public ICommand CombineCommand { get; }
     public ICommand ExportCommand { get; }
     public ICommand CopyPageTextCommand { get; }
+    public ICommand SaveSearchableCopyCommand { get; }
+    public ICommand CancelOcrExportCommand { get; }
+    public ICommand CalibrateMeasurementCommand { get; }
+    public ICommand ResetMeasurementScaleCommand { get; }
     public ICommand DeleteAnnotationCommand { get; }
     public ICommand EditAnnotationTextCommand { get; }
     public ICommand PropertiesCommand { get; }
@@ -374,18 +395,26 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
         FindCommand = new RelayCommand(() => { NavigationTab = 2; FindRequested?.Invoke(); }, Available);
         NextMatchCommand = new RelayCommand(() => MoveMatch(1), () => Matches.Count > 0);
         PreviousMatchCommand = new RelayCommand(() => MoveMatch(-1), () => Matches.Count > 0);
-        RotateCommand = Async(() => ChangeAsync(d => d.RotatePage(CurrentPage - 1, 1), CurrentPage - 1), CanAssemble);
-        DeletePageCommand = Async(async () =>
-        {
-            if (_dialogs.Confirm("Удалить страницу", $"Удалить страницу {CurrentPage}? Действие можно отменить."))
-                await ChangeAsync(d => d.DeletePage(CurrentPage - 1));
-        }, () => CanAssemble() && PageCount > 1);
-        MovePageUpCommand = Async(() => MovePageAsync(-1), () => CanAssemble() && CurrentPage > 1);
-        MovePageDownCommand = Async(() => MovePageAsync(1), () => CanAssemble() && CurrentPage < PageCount);
+        RotateCommand = Async(RotateSelectedPagesAsync, CanAssemble);
+        DeletePageCommand = Async(DeleteSelectedPagesAsync, () => CanAssemble() && SelectedPages().Length < PageCount);
+        MovePageUpCommand = Async(() => MovePagesAsync(SelectedPages()[0] - 1), () => CanAssemble() && SelectedPages()[0] > 0);
+        MovePageDownCommand = Async(() => MovePagesAsync(SelectedPages()[^1] + 2), () => CanAssemble() && SelectedPages()[^1] < PageCount - 1);
         InsertPageCommand = Async(() => ChangeAsync(d => d.InsertBlankPage(CurrentPage)), CanAssemble);
         ImportCommand = Async(ImportAsync, CanAssemble);
+        CombineCommand = Async(CombineAsync, () => !IsBusy);
         ExportCommand = Async(ExportAsync, () => CanInteract && Info?.CanCopy == true);
         CopyPageTextCommand = Async(CopyPageTextAsync, () => CanInteract && Info?.CanCopy == true);
+        SaveSearchableCopyCommand = Async(SaveSearchableCopyAsync, () => CanInteract && Info is { CanCopy: true, CanEdit: true });
+        CancelOcrExportCommand = new RelayCommand(() => _ocrExportCancellation?.Cancel(), () => IsOcrExporting);
+        CalibrateMeasurementCommand = new RelayCommand(CalibrateMeasurement,
+            () => CanInteract && IsMeasuring && Pages.ElementAtOrDefault(CurrentPage - 1)?.Measurement is not null);
+        ResetMeasurementScaleCommand = new RelayCommand(() =>
+        {
+            var page = Pages[CurrentPage - 1];
+            page.SetMeasurementScale(1);
+            Status = page.Measurement is { } measurement ? $"На странице: {measurement.Millimetres:0.##} мм" : ToolHint;
+            CommandManager.InvalidateRequerySuggested();
+        }, () => CanInteract && IsMeasuring && Pages.ElementAtOrDefault(CurrentPage - 1) is { MeasurementScale: not 1 });
         bool CanAnnotate() => CanInteract && Info?.CanAnnotate == true;
         DeleteAnnotationCommand = Async(() => SelectedAnnotation is { } a ? DeleteCommentAsync(a) : Task.CompletedTask,
             () => CanAnnotate() && SelectedAnnotation is not null);
@@ -420,9 +449,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
     private async void ActivateDocumentAsync()
     {
         CancelSearch();
-        _tool = DocumentTool.Select;
-        Notify(nameof(Tool));
-        Notify(nameof(CurrentColor));
+        Tool = DocumentTool.Select;
         try
         {
             await BusyAsync("Загрузка документа…", () => RefreshAsync());
@@ -448,6 +475,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
         var selected = SelectedAnnotation;
         SetMatches([]);
         Info = data?.Info;
+        Notify(nameof(CanSearchScans));
         if (document is not null && data is not null)
         {
             UpdatePages(document, data.Pages);
@@ -484,7 +512,12 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
                      nameof(WindowTitle), nameof(Info), nameof(DocumentSummary), nameof(SearchSummary), nameof(OcrStatus) })
             Notify(name);
         CommandManager.InvalidateRequerySuggested();
-        if (HasDocument && changedPage is null) NavigateRequested?.Invoke(CurrentPage - 1);
+        if (changedPage is null)
+        {
+            SetSelectedThumbnails([]);
+            ThumbnailSelectionRequested?.Invoke([]);
+            if (HasDocument) NavigateRequested?.Invoke(CurrentPage - 1);
+        }
     }
 
     private void UpdatePages(PdfDocument document, IReadOnlyList<PdfPageInfo> pages)
@@ -514,6 +547,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
 
     private async Task AddDocumentAsync(PdfDocument document)
     {
+        CancelSearch();
         var tab = new DocumentTab(document, _recovery.NewId());
         if (document.FilePath is { } path)
         {
@@ -550,6 +584,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
             CancelSearch();
             Tool = DocumentTool.Select;
             await BusyAsync("Загрузка документа…", () => RefreshAsync());
+            if (!string.IsNullOrWhiteSpace(Query)) QueueSearch();
             return;
         }
         await BusyAsync("Открытие PDF…", async () =>
@@ -557,6 +592,7 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
             var document = await LoadWithPasswordAsync(Path.GetFileName(path), password => PdfDocument.Open(path, password));
             if (document is not null) await AddDocumentAsync(document);
         });
+        if (!string.IsNullOrWhiteSpace(Query)) QueueSearch();
     }
 
     private async Task<PdfDocument?> LoadWithPasswordAsync(string name, Func<string?, PdfDocument> open)
@@ -655,37 +691,134 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
         if (!string.IsNullOrWhiteSpace(Query)) QueueSearch();
     }
 
-    private async Task MovePageAsync(int direction)
+    internal void SetSelectedThumbnails(int[] indices)
     {
-        var from = CurrentPage - 1;
-        var to = from + direction;
-        await ChangeAsync(d => d.MovePage(from, to));
-        CurrentPage = to + 1;
+        _selectedThumbnails = indices;
+        CommandManager.InvalidateRequerySuggested();
+    }
+
+    private int[] SelectedPages() =>
+        NavigationTab == 0 && _selectedThumbnails.Length > 1 ? _selectedThumbnails : [CurrentPage - 1];
+
+    private async Task RotateSelectedPagesAsync()
+    {
+        var pages = SelectedPages();
+        await ChangeAsync(d => d.RotatePages(pages, 1), pages.Length == 1 ? pages[0] : null);
+        if (pages.Length > 1) RestoreThumbnailSelection(pages);
+    }
+
+    internal void Measure(PageItem page, Point start, Point end)
+    {
+        page.Measure(start, end);
+        if (page.Measurement is { } measurement)
+            Status = $"{(page.MeasurementScale == 1 ? "На странице" : "По масштабу чертежа")}: {measurement.Millimetres:0.##} мм";
+        CommandManager.InvalidateRequerySuggested();
+    }
+
+    private void CalibrateMeasurement()
+    {
+        if (Pages.ElementAtOrDefault(CurrentPage - 1) is not { Measurement: { } measurement } page) return;
+        var value = _dialogs.AskText("Масштаб чертежа", "Укажите реальную длину отмеченного отрезка в миллиметрах.",
+            measurement.Millimetres.ToString("0.######", CultureInfo.CurrentCulture));
+        if (value is null) return;
+        if (!double.TryParse(value.Trim().Replace(',', '.'), NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out var length) ||
+            !double.IsFinite(length) || length <= 0)
+        {
+            _dialogs.Info("Масштаб чертежа", "Введите положительную длину в миллиметрах.");
+            return;
+        }
+        var scale = length / page.MeasurePageDistance(measurement.Start, measurement.End);
+        if (scale <= 0 || !double.IsFinite(scale * page.MeasurePageDistance(new(0, 0), new(1, 1))))
+        {
+            _dialogs.Info("Масштаб чертежа", "Эта длина выходит за пределы расчёта масштаба.");
+            return;
+        }
+        page.SetMeasurementScale(scale);
+        Status = $"Масштаб страницы задан. Длина отрезка: {length:0.##} мм";
+        CommandManager.InvalidateRequerySuggested();
+    }
+
+    private async Task DeleteSelectedPagesAsync()
+    {
+        var pages = SelectedPages();
+        var prompt = pages.Length == 1 ? $"Удалить страницу {pages[0] + 1}?" : $"Удалить выбранные страницы ({pages.Length})?";
+        if (_dialogs.Confirm("Удаление страниц", prompt + " Действие можно отменить."))
+            await ChangeAsync(d => d.DeletePages(pages));
+    }
+
+    internal async Task MovePagesAsync(int boundary)
+    {
+        if (!CanInteract || Info?.CanAssemble != true || boundary < 0 || boundary > PageCount) return;
+        var indices = SelectedPages();
+        var destination = boundary - indices.Count(index => index < boundary);
+        if (indices.Where((index, offset) => index != destination + offset).Any())
+        {
+            await ChangeAsync(d => d.MovePages(indices, destination));
+            CurrentPage = destination + 1;
+            RestoreThumbnailSelection(Enumerable.Range(destination, indices.Length).ToArray());
+        }
+    }
+
+    private void RestoreThumbnailSelection(int[] indices)
+    {
+        SetSelectedThumbnails(indices);
+        ThumbnailSelectionRequested?.Invoke(indices);
     }
 
     private async Task ImportAsync()
     {
         var paths = _dialogs.ChooseOpenFiles();
-        if (paths.Length == 0 || Document is not { } document) return;
-        CancelSearch();
+        if (paths.Length == 0) return;
+        if (paths.Length > 1) paths = _dialogs.OrderPageSources(paths);
+        if (paths.Length == 0) return;
         var index = CurrentPage;
-        await BusyAsync("Импорт страниц…", async () =>
+        await WithPageSourcesAsync(paths, sources => ChangeAsync(document => document.ImportPages(sources, index)));
+    }
+
+    private async Task CombineAsync()
+    {
+        var paths = _dialogs.ChooseOpenFiles();
+        if (paths.Length == 0) return;
+        if (paths.Length == 1) throw new ArgumentException("Для объединения выберите два или больше PDF.");
+        paths = _dialogs.OrderPageSources(paths);
+        if (paths.Length == 0) return;
+        await WithPageSourcesAsync(paths, sources => BusyAsync("Объединение PDF…",
+            async () => await AddDocumentAsync(await Task.Run(() => PdfDocument.CombinePages(sources)))));
+        if (!string.IsNullOrWhiteSpace(Query)) QueueSearch();
+    }
+
+    private async Task WithPageSourcesAsync(string[] paths, Func<List<PdfDocument>, Task> use)
+    {
+        var sources = new List<PdfDocument>();
+        try
         {
-            foreach (var path in paths)
+            var openedAll = false;
+            await BusyAsync("Открытие исходных PDF…", async () =>
             {
-                using var source = await LoadWithPasswordAsync(Path.GetFileName(path), password => PdfDocument.Open(path, password));
-                if (source is null) continue;
-                await Task.Run(() => document.ImportPages(source, index));
-                index += source.PageCount;
-            }
-            await RefreshAsync();
-        });
+                foreach (var path in paths)
+                {
+                    var source = await LoadWithPasswordAsync(Path.GetFileName(path), password => PdfDocument.Open(path, password));
+                    if (source is null) return;
+                    sources.Add(source);
+                }
+                openedAll = true;
+            });
+            if (openedAll) await use(sources);
+        }
+        finally
+        {
+            await Task.Run(() =>
+            {
+                foreach (var source in sources) source.Dispose();
+            });
+        }
     }
 
     private async Task ExportAsync()
     {
         var document = Document!;
-        var range = _dialogs.AskText("Извлечь страницы", $"Введите номера страниц от 1 до {PageCount}. Пример: 1-3,5.", CurrentPage.ToString());
+        var range = _dialogs.AskText("Извлечь страницы", $"Введите номера страниц от 1 до {PageCount}. Пример: 1-3,5.",
+            string.Join(",", SelectedPages().Select(index => index + 1)));
         if (string.IsNullOrWhiteSpace(range)) return;
         var path = _dialogs.ChooseSaveFile("Страницы.pdf");
         if (path is null) return;
@@ -693,6 +826,51 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
             throw new IOException("Для извлечённых страниц выберите другой файл.");
         await BusyAsync("Извлечение страниц…", () => Task.Run(() => AtomicFile.Write(path, document.ExportPages(range))));
         Status = "Страницы сохранены в отдельный PDF";
+    }
+
+    private async Task SaveSearchableCopyAsync()
+    {
+        var document = Document!;
+        var range = _dialogs.AskText("Распознать страницы и сохранить копию",
+            $"Укажите страницы от 1 до {PageCount}, например 1, 3-5. Текстовый слой добавляется на страницы без текста.",
+            PageCount == 1 ? "1" : $"1-{PageCount}");
+        if (range is null) return;
+        var pages = PrintLayout.SelectPages(range, PageCount);
+        var name = Path.GetFileNameWithoutExtension(document.FilePath) ?? "Документ";
+        var path = _dialogs.ChooseSaveFile(name + " — OCR.pdf");
+        if (path is null) return;
+        path = Path.GetFullPath(path);
+        if (Documents.Any(tab => string.Equals(path, tab.Path, StringComparison.OrdinalIgnoreCase)))
+            throw new IOException("Для копии с текстовым слоем выберите файл, который не открыт в PaperDesk.");
+
+        CancelSearch();
+        using var cancellation = new CancellationTokenSource();
+        _ocrExportCancellation = cancellation;
+        Notify(nameof(IsOcrExporting));
+        var options = _settings.Value.Ocr;
+        var progress = new Progress<(int Current, int Total)>(p =>
+        {
+            if (ReferenceEquals(_ocrExportCancellation, cancellation)) Status = $"OCR: обработка страницы {p.Current} из {p.Total}";
+        });
+        try
+        {
+            var added = 0;
+            await BusyAsync("Подготовка копии для OCR…", async () =>
+            {
+                added = await Task.Run(() => OcrService.SaveSearchableCopyAsync(document, path, pages, options, progress, cancellation.Token));
+            });
+            Status = added == 0 ? "Новых текстовых слоёв нет. Копия не создана." : $"Копия сохранена. Страниц с новым OCR-слоем: {added}.";
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            Status = "Создание копии с OCR отменено.";
+        }
+        finally
+        {
+            _ocrExportCancellation = null;
+            Notify(nameof(IsOcrExporting));
+            if (!string.IsNullOrWhiteSpace(Query)) QueueSearch();
+        }
     }
 
     private async Task CopyPageTextAsync()
@@ -893,12 +1071,15 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
         CancelSearch();
         SetMatches([]);
         SelectedMatch = null;
+        _searchProgress = null;
+        _scanSearchIncomplete = false;
         Notify(nameof(SearchSummary));
-        if (!HasDocument || string.IsNullOrWhiteSpace(Query)) return;
+        if (ActiveTab is not { } tab || IsOcrExporting || string.IsNullOrWhiteSpace(Query)) return;
         var cancellation = new CancellationTokenSource();
         _searchCancellation = cancellation;
         var token = cancellation.Token;
-        var document = Document!;
+        var document = tab.Document;
+        var scanOptions = SearchScans && CanSearchScans ? _settings.Value.Ocr with { Enabled = true } : null;
         var query = Query;
         var matchCase = MatchCase;
         var wholeWord = WholeWord;
@@ -910,6 +1091,31 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
             if (token.IsCancellationRequested || Document != document) return;
             SetMatches(results);
             SelectedMatch = Matches.FirstOrDefault();
+            CommandManager.InvalidateRequerySuggested();
+            if (scanOptions is not null)
+            {
+                for (var index = 0; index < document.PageCount && Matches.Count < 10000; index++)
+                {
+                    token.ThrowIfCancellationRequested();
+                    _searchProgress = $"OCR: {index + 1} / {document.PageCount}";
+                    Notify(nameof(SearchSummary));
+                    OcrPage? page;
+                    try { page = await tab.Ocr.EnsureAsync(index, scanOptions, token); }
+                    catch (OperationCanceledException) when (!token.IsCancellationRequested)
+                    {
+                        // The first request can belong to a view that was scrolled away.
+                        var pageIndex = index;
+                        page = await Task.Run(() => OcrService.RecognizePageAsync(document, pageIndex, scanOptions, token), token);
+                    }
+                    token.ThrowIfCancellationRequested();
+                    if (page is null) continue;
+                    var native = GetPageMatches(index);
+                    var remaining = 10000 - Matches.Count;
+                    var recognized = await Task.Run(() => page.Search(index, query, matchCase, wholeWord, native, remaining, token), token);
+                    token.ThrowIfCancellationRequested();
+                    if (recognized.Count > 0) AddScanMatches(index, recognized);
+                }
+            }
         }
         catch (OperationCanceledException)
         {
@@ -919,17 +1125,46 @@ public sealed class WorkspaceViewModel : ObservableObject, IDisposable
         }
         catch (Exception ex)
         {
-            if (!token.IsCancellationRequested) ShowError(ex);
+            if (!token.IsCancellationRequested)
+            {
+                if (_searchProgress is null) ShowError(ex);
+                else
+                {
+                    _scanSearchIncomplete = true;
+                    Status = "Поиск по сканам: " + ex.Message;
+                    ErrorLog.Write("Поиск по сканам", ex);
+                }
+            }
         }
         finally
         {
             if (ReferenceEquals(_searchCancellation, cancellation))
             {
+                _searchCancellation = null;
+                cancellation.Dispose();
                 IsSearching = false;
-                Notify(nameof(SearchSummary));
                 CommandManager.InvalidateRequerySuggested();
             }
         }
+    }
+
+    private void AddScanMatches(int index, IReadOnlyList<SearchMatch> matches)
+    {
+        var first = 0;
+        var last = Matches.Count;
+        while (first < last)
+        {
+            var middle = (first + last) / 2;
+            if (Matches[middle].PageIndex <= index) first = middle + 1;
+            else last = middle;
+        }
+        if (!_pageMatches.TryGetValue(index, out var pageMatches)) _pageMatches[index] = pageMatches = [];
+        pageMatches.AddRange(matches);
+        foreach (var match in matches) Matches.Insert(first++, match);
+        _matchesVersion++;
+        Notify(nameof(MatchesVersion));
+        SelectedMatch ??= Matches.FirstOrDefault();
+        CommandManager.InvalidateRequerySuggested();
     }
 
     private void MoveMatch(int delta)

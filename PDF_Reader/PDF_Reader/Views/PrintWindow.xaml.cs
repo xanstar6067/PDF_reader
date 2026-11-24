@@ -197,6 +197,7 @@ public partial class PrintWindow : Window
             Rows = mode == PrintMode.Multiple ? Integer(RowsBox, "строки", 8) : 2,
             PageOrder = (PrintPageOrder)OrderBox.SelectedIndex,
             AutoRotate = AutoRotateBox.IsChecked == true, Grayscale = GrayBox.IsChecked == true,
+            RasterDpi = RasterDpiBox.SelectedIndex switch { 1 => 300, 2 => 600, _ => PrintOptions.DefaultRasterDpi },
             CutMarks = CutMarksBox.IsChecked == true, Labels = LabelsBox.IsChecked == true,
             TileOnlyLargePages = LargeOnlyBox.IsChecked == true, PageBorder = mode == PrintMode.Multiple && BorderBox.IsChecked == true,
             BookletSide = (BookletSide)BookletSideBox.SelectedIndex, RightBinding = RightBindingBox.IsChecked == true

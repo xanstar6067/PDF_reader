@@ -2,6 +2,8 @@ using System.ComponentModel;
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
@@ -15,6 +17,11 @@ public partial class MainWindow : Window
 {
     private static readonly TimeSpan AutosaveInterval = TimeSpan.FromSeconds(60);
     private bool _closeApproved, _closing, _navigating, _fullscreen;
+    private bool _syncingThumbnails, _deferThumbnailClick;
+    private PageItem? _thumbnailDragPage;
+    private Point _thumbnailDragStart;
+    private ThumbnailDropIndicator? _thumbnailDropIndicator;
+    private AdornerLayer? _thumbnailDropLayer;
     private WindowState _previousState;
     private readonly DispatcherTimer _scrollTimer;
     private readonly DispatcherTimer _autosaveTimer;
@@ -58,6 +65,7 @@ public partial class MainWindow : Window
         Workspace = new WorkspaceViewModel(_dialogs, settings, recovery);
         DataContext = Workspace;
         Workspace.NavigateRequested += NavigateTo;
+        Workspace.ThumbnailSelectionRequested += SelectThumbnails;
         Workspace.FindRequested += () => Dispatcher.BeginInvoke(() =>
         {
             SearchBox.Focus();
@@ -172,7 +180,12 @@ public partial class MainWindow : Window
                 return;
             }
             PageList.ScrollIntoView(page);
-            ThumbnailList.SelectedItem = page;
+            if (ThumbnailList.SelectedItems.Count <= 1)
+            {
+                _syncingThumbnails = true;
+                ThumbnailList.SelectedItem = page;
+                _syncingThumbnails = false;
+            }
             ThumbnailList.ScrollIntoView(page);
             Dispatcher.BeginInvoke(() =>
             {
@@ -237,7 +250,147 @@ public partial class MainWindow : Window
 
     private void Thumbnails_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (!_navigating && ((ListBox)sender).SelectedItem is PageItem page && Workspace?.CanInteract == true) Workspace.CurrentPage = page.Number;
+        if (_syncingThumbnails || Workspace?.CanInteract != true) return;
+        Workspace.SetSelectedThumbnails(ThumbnailList.SelectedItems.OfType<PageItem>().Select(page => page.Info.Index).Order().ToArray());
+        if (e.AddedItems.OfType<PageItem>().LastOrDefault() is { } page)
+            Workspace.CurrentPage = page.Number;
+    }
+
+    private void SelectThumbnails(int[] indices)
+    {
+        _syncingThumbnails = true;
+        try
+        {
+            ThumbnailList.UnselectAll();
+            foreach (var index in indices) ThumbnailList.SelectedItems.Add(Workspace.Pages[index]);
+        }
+        finally { _syncingThumbnails = false; }
+    }
+
+    private ListBoxItem? ThumbnailAt(object source) =>
+        source is DependencyObject hit ? ItemsControl.ContainerFromElement(ThumbnailList, hit) as ListBoxItem : null;
+
+    private void Thumbnails_MouseDown(object sender, MouseButtonEventArgs e)
+    {
+        _thumbnailDragPage = null;
+        _deferThumbnailClick = false;
+        if (Keyboard.Modifiers != ModifierKeys.None || !Workspace.CanInteract ||
+            ThumbnailAt(e.OriginalSource) is not { Content: PageItem page } row) return;
+        if (Workspace.Info?.CanAssemble != true) return;
+        _thumbnailDragPage = page;
+        _thumbnailDragStart = e.GetPosition(ThumbnailList);
+        _deferThumbnailClick = row.IsSelected && ThumbnailList.SelectedItems.Count > 1;
+        if (_deferThumbnailClick) e.Handled = true;
+    }
+
+    private void Thumbnails_MouseUp(object sender, MouseButtonEventArgs e)
+    {
+        if (_deferThumbnailClick && _thumbnailDragPage is { } page &&
+            ThumbnailAt(e.OriginalSource) is { Content: PageItem released } row && ReferenceEquals(page, released))
+        {
+            ThumbnailList.UnselectAll();
+            ThumbnailList.SelectedItem = page;
+            row.Focus();
+            Workspace.CurrentPage = page.Number;
+            e.Handled = true;
+        }
+        _thumbnailDragPage = null;
+        _deferThumbnailClick = false;
+    }
+
+    private void Thumbnails_MouseMove(object sender, MouseEventArgs e)
+    {
+        if (e.LeftButton != MouseButtonState.Pressed)
+        {
+            _thumbnailDragPage = null;
+            _deferThumbnailClick = false;
+            return;
+        }
+        if (_thumbnailDragPage is not { } page || !Workspace.CanInteract || Workspace.Document != page.Document) return;
+        var movement = e.GetPosition(ThumbnailList) - _thumbnailDragStart;
+        if (Math.Abs(movement.X) < SystemParameters.MinimumHorizontalDragDistance &&
+            Math.Abs(movement.Y) < SystemParameters.MinimumVerticalDragDistance) return;
+
+        _thumbnailDragPage = null;
+        _deferThumbnailClick = false;
+        if (!ThumbnailList.SelectedItems.Contains(page)) ThumbnailList.SelectedItem = page;
+        if (ThumbnailList.SelectedItems.Count == 1) Workspace.SetVisiblePage(page.Info.Index);
+        e.Handled = true;
+        try { DragDrop.DoDragDrop(ThumbnailList, new DataObject(typeof(PageItem), page), DragDropEffects.Move); }
+        finally { ClearThumbnailDropIndicator(); }
+    }
+
+    private (int Boundary, ListBoxItem Row, bool After)? ThumbnailDropTarget(DragEventArgs e)
+    {
+        if (e.Data.GetData(typeof(PageItem)) is not PageItem dragging || Workspace.Document != dragging.Document ||
+            !Workspace.CanInteract || Workspace.Info?.CanAssemble != true) return null;
+        if (ThumbnailAt(e.OriginalSource) is { Content: PageItem target } row)
+        {
+            var after = e.GetPosition(row).Y >= row.ActualHeight / 2;
+            return (target.Info.Index + (after ? 1 : 0), row, after);
+        }
+        if (ThumbnailList.ItemContainerGenerator.ContainerFromIndex(Workspace.PageCount - 1) is ListBoxItem last)
+        {
+            var point = e.GetPosition(last);
+            if (point.Y >= last.ActualHeight && point.X >= 0 && point.X <= last.ActualWidth)
+                return (Workspace.PageCount, last, true);
+        }
+        return null;
+    }
+
+    private void Thumbnails_DragOver(object sender, DragEventArgs e)
+    {
+        if (!e.Data.GetDataPresent(typeof(PageItem))) return;
+        e.Handled = true;
+        e.Effects = DragDropEffects.None;
+        if (ThumbnailDropTarget(e) is not { } target)
+        {
+            ClearThumbnailDropIndicator();
+            return;
+        }
+        e.Effects = DragDropEffects.Move;
+        if (FindVisual<ScrollViewer>(ThumbnailList) is { } viewer)
+        {
+            var y = e.GetPosition(viewer).Y;
+            if (y < 28) viewer.ScrollToVerticalOffset(viewer.VerticalOffset - 18);
+            else if (y > viewer.ActualHeight - 28) viewer.ScrollToVerticalOffset(viewer.VerticalOffset + 18);
+        }
+        if (_thumbnailDropIndicator is { } prior && prior.AdornedElement == target.Row && prior.After == target.After) return;
+        ClearThumbnailDropIndicator();
+        if (AdornerLayer.GetAdornerLayer(target.Row) is not { } layer) return;
+        _thumbnailDropLayer = layer;
+        _thumbnailDropIndicator = new ThumbnailDropIndicator(target.Row, target.After, (Brush)FindResource("Accent")) { IsHitTestVisible = false };
+        layer.Add(_thumbnailDropIndicator);
+    }
+
+    private void Thumbnails_DragLeave(object sender, DragEventArgs e) => ClearThumbnailDropIndicator();
+
+    private async void Thumbnails_Drop(object sender, DragEventArgs e)
+    {
+        ClearThumbnailDropIndicator();
+        if (!e.Data.GetDataPresent(typeof(PageItem))) return;
+        e.Handled = true;
+        if (ThumbnailDropTarget(e) is not { } target) return;
+        try { await Workspace.MovePagesAsync(target.Boundary); }
+        catch (Exception ex) { Workspace.ShowError(ex); }
+    }
+
+    private void ClearThumbnailDropIndicator()
+    {
+        if (_thumbnailDropIndicator is not { } indicator) return;
+        _thumbnailDropLayer?.Remove(indicator);
+        _thumbnailDropLayer = null;
+        _thumbnailDropIndicator = null;
+    }
+
+    private sealed class ThumbnailDropIndicator(UIElement element, bool after, Brush brush) : Adorner(element)
+    {
+        public bool After { get; } = after;
+        protected override void OnRender(DrawingContext context)
+        {
+            var y = After ? AdornedElement.RenderSize.Height - 2 : 2;
+            context.DrawLine(new Pen(brush, 3), new Point(6, y), new Point(Math.Max(6, AdornedElement.RenderSize.Width - 6), y));
+        }
     }
 
     private void Outline_Changed(object sender, RoutedPropertyChangedEventArgs<object> e)
@@ -352,7 +505,7 @@ public partial class MainWindow : Window
         }
         ICommand? command = (e.Key, Keyboard.Modifiers) switch
         {
-            (Key.Delete, ModifierKeys.None) => Workspace.DeleteAnnotationCommand,
+            (Key.Delete, ModifierKeys.None) => ThumbnailList.IsKeyboardFocusWithin ? Workspace.DeletePageCommand : Workspace.DeleteAnnotationCommand,
             (Key.Z, ModifierKeys.Control) => Workspace.UndoCommand,
             (Key.Y, ModifierKeys.Control) => Workspace.RedoCommand,
             (Key.PageDown, ModifierKeys.None) => Workspace.NextPageCommand,

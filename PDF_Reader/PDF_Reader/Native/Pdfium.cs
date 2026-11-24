@@ -73,6 +73,9 @@ internal static class Pdfium
     [DllImport(Dll)] internal static extern nint FPDFPage_New(nint document, int index, double width, double height);
     [DllImport(Dll)] internal static extern void FPDFPage_Delete(nint document, int index);
     [DllImport(Dll)] internal static extern int FPDF_MovePages(nint document, int[] pages, uint count, int destination);
+    [DllImport(Dll)] internal static extern nint FPDF_NewXObjectFromPage(nint destination, nint source, int pageIndex);
+    [DllImport(Dll)] internal static extern nint FPDF_NewFormObjectFromXObject(nint xObject);
+    [DllImport(Dll)] internal static extern void FPDF_CloseXObject(nint xObject);
     [DllImport(Dll)] internal static extern int FPDFPage_GetRotation(nint page);
     [DllImport(Dll)] internal static extern void FPDFPage_SetRotation(nint page, int rotation);
     [DllImport(Dll)] internal static extern int FPDFPage_GenerateContent(nint page);

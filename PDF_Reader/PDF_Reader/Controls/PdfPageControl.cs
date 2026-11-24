@@ -29,6 +29,10 @@ public sealed class PdfPageControl : FrameworkElement
     public static readonly DependencyProperty WorkspaceProperty =DependencyProperty.Register(nameof(Workspace), typeof(WorkspaceViewModel), typeof(PdfPageControl));
     public static readonly DependencyProperty ThumbnailProperty = DependencyProperty.Register(nameof(Thumbnail), typeof(bool), typeof(PdfPageControl),
         new FrameworkPropertyMetadata(false, ItemChanged));
+    public static readonly DependencyProperty MeasurementProperty = DependencyProperty.Register(nameof(Measurement), typeof(PageMeasurement), typeof(PdfPageControl),
+        new FrameworkPropertyMetadata(null, FrameworkPropertyMetadataOptions.AffectsRender));
+    public static readonly DependencyProperty MeasurementModeProperty = DependencyProperty.Register(nameof(MeasurementMode), typeof(bool), typeof(PdfPageControl),
+        new FrameworkPropertyMetadata(false, FrameworkPropertyMetadataOptions.AffectsRender));
 
     public PageItem? Item { get => (PageItem?)GetValue(ItemProperty); set => SetValue(ItemProperty, value); }
     public int Version { get => (int)GetValue(VersionProperty); set => SetValue(VersionProperty, value); }
@@ -37,6 +41,8 @@ public sealed class PdfPageControl : FrameworkElement
     public PdfComment? SelectedAnnotation { get => (PdfComment?)GetValue(SelectedAnnotationProperty); set => SetValue(SelectedAnnotationProperty, value); }
     public WorkspaceViewModel? Workspace { get => (WorkspaceViewModel?)GetValue(WorkspaceProperty); set => SetValue(WorkspaceProperty, value); }
     public bool Thumbnail { get => (bool)GetValue(ThumbnailProperty); set => SetValue(ThumbnailProperty, value); }
+    public PageMeasurement? Measurement { get => (PageMeasurement?)GetValue(MeasurementProperty); set => SetValue(MeasurementProperty, value); }
+    public bool MeasurementMode { get => (bool)GetValue(MeasurementModeProperty); set => SetValue(MeasurementModeProperty, value); }
 
     private const double FullRenderPixels = 4_000_000;
     private const double BaseRenderPixels = 1_500_000;
@@ -47,9 +53,11 @@ public sealed class PdfPageControl : FrameworkElement
     private static readonly Brush CurrentMatchBrush = FrozenBrush(Color.FromArgb(150, 255, 150, 20));
     private static readonly Pen SelectionPen = FrozenPen(new Pen(FrozenBrush(Color.FromRgb(46, 117, 224)), 1.25) { DashStyle = DashStyles.Dash });
     private static readonly Pen HandlePen = FrozenPen(new Pen(FrozenBrush(Color.FromRgb(46, 117, 224)), 1.25));
+    private static readonly Pen MeasureOutline = FrozenPen(new Pen(Brushes.White, 4));
+    private static readonly Pen MeasurePen = FrozenPen(new Pen(FrozenBrush(Color.FromRgb(23, 84, 154)), 2));
     private const double HandleSize = 8;
 
-    private enum Drag { None, Text, Shape, Ink, Move, Resize }
+    private enum Drag { None, Text, Shape, Ink, Move, Resize, Measure }
 
     private BitmapSource? _image;
     private (int Width, int Version) _imageKey;
@@ -378,6 +386,8 @@ public sealed class PdfPageControl : FrameworkElement
             foreach (var rect in selection.Rectangles) dc.DrawRectangle(SelectionBrush, null, DisplayRect(rect));
         if (SelectedAnnotation is { } selected && selected.PageIndex == item.Info.Index && _drag is not (Drag.Move or Drag.Resize))
             DrawSelection(dc, DisplayRect(selected.Bounds), selected.CanResize);
+        if (MeasurementMode && _drag != Drag.Measure && Measurement is { } measurement)
+            DrawMeasurement(dc, DisplayPoint(measurement.Start), DisplayPoint(measurement.End), measurement.Millimetres);
         if (_anchor is not { } anchor) return;
         switch (_drag)
         {
@@ -405,7 +415,27 @@ public sealed class PdfPageControl : FrameworkElement
                 }
                 dc.DrawGeometry(null, ShapePen(vm), geometry);
                 break;
+            case Drag.Measure when MeasurementMode:
+                var end = Clamp(_dragPoint);
+                DrawMeasurement(dc, anchor, end, item.MeasurePageDistance(Normalize(anchor), Normalize(end)) * item.MeasurementScale);
+                break;
         }
+    }
+
+    private void DrawMeasurement(DrawingContext dc, Point start, Point end, double millimetres)
+    {
+        dc.DrawLine(MeasureOutline, start, end);
+        dc.DrawLine(MeasurePen, start, end);
+        dc.DrawEllipse(Brushes.White, MeasurePen, start, 3, 3);
+        dc.DrawEllipse(Brushes.White, MeasurePen, end, 3, 3);
+        var label = new FormattedText($"{millimetres:0.##} мм", System.Globalization.CultureInfo.CurrentCulture,
+            FlowDirection.LeftToRight, new Typeface("Segoe UI"), 12, Brushes.White, VisualTreeHelper.GetDpi(this).PixelsPerDip);
+        var width = label.Width + 12;
+        var height = label.Height + 6;
+        var x = Math.Clamp(end.X + 8, 0, Math.Max(0, ActualWidth - width));
+        var y = Math.Clamp(end.Y - height - 8, 0, Math.Max(0, ActualHeight - height));
+        dc.DrawRoundedRectangle(MeasurePen.Brush, MeasureOutline, new Rect(x, y, width, height), 4, 4);
+        dc.DrawText(label, new Point(x + 6, y + 3));
     }
 
     private Pen ShapePen(WorkspaceViewModel vm)
@@ -425,6 +455,7 @@ public sealed class PdfPageControl : FrameworkElement
     }
 
     private Rect DisplayRect(Rect rect) => new(rect.X * ActualWidth, rect.Y * ActualHeight, rect.Width * ActualWidth, rect.Height * ActualHeight);
+    private Point DisplayPoint(Point point) => new(point.X * ActualWidth, point.Y * ActualHeight);
 
     private Point Normalize(Point point) => new(Math.Clamp(point.X / ActualWidth, 0, 1), Math.Clamp(point.Y / ActualHeight, 0, 1));
 
@@ -492,6 +523,7 @@ public sealed class PdfPageControl : FrameworkElement
             else vm.SelectedAnnotation = null;
         }
         else if (vm.Tool is DocumentTool.Rectangle or DocumentTool.Ellipse) _drag = Drag.Shape;
+        else if (vm.Tool == DocumentTool.Measure) _drag = Drag.Measure;
         else if (vm.Tool == DocumentTool.Ink)
         {
             _drag = Drag.Ink;
@@ -529,7 +561,7 @@ public sealed class PdfPageControl : FrameworkElement
                 return Cursors.IBeam;
             case DocumentTool.Note or DocumentTool.Ink:
                 return Cursors.Pen;
-            case DocumentTool.Rectangle or DocumentTool.Ellipse:
+            case DocumentTool.Rectangle or DocumentTool.Ellipse or DocumentTool.Measure:
                 return Cursors.Cross;
             case DocumentTool.Select:
                 if (vm.SelectedAnnotation is { CanResize: true } selected && selected.PageIndex == item.Info.Index && ResizeAnchorAt(selected, position) is { } opposite)
@@ -581,6 +613,9 @@ public sealed class PdfPageControl : FrameworkElement
                     return;
                 case Drag.Ink:
                     if (dragged && ink.Count > 1) await vm.AddInkAsync(index, ink);
+                    return;
+                case Drag.Measure:
+                    if (dragged && startNormalized != endNormalized && vm.IsMeasuring) vm.Measure(item, startNormalized, endNormalized);
                     return;
             }
             if (vm.Tool is DocumentTool.EditText or DocumentTool.AddText or DocumentTool.Note)

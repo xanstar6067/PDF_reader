@@ -36,6 +36,7 @@ internal static class Program
             if (args.Contains("--ocr-only")) return 0;
 
             TestDocument(output);
+            TestPageGroupsAndMeasurement();
             Console.WriteLine("PASS: editing, search, outlines, annotations, pages");
             TestHistory(output);
             TestProtection(output);
@@ -103,6 +104,10 @@ internal static class Program
         Console.WriteLine("OCR: " + result.Text.Replace('\n', ' '));
         Check(result.Text.Contains("Проверка") && result.Text.Contains("PaperDesk"), "memory-only OCR recognizes Russian and English");
         var bounds = original.Search("PaperDesk", false, false, default).Single().Rectangles[0];
+        var scanHit = result.Search(0, "paperdesk document", false, true, [], 10, default).Single();
+        Check(scanHit.Rectangles.Any(rect => rect.IntersectsWith(bounds)) &&
+            result.Search(0, "paperdesk", true, false, [], 10, default).Count == 0 &&
+            result.Search(0, "Paper", false, true, [], 10, default).Count == 0, "OCR search has aligned rectangles, case and whole-word filtering");
         var selection = Task.Run(() => result.Select(new Point(bounds.Left + .003, bounds.Top + bounds.Height / 2), new Point(bounds.Right - .003, bounds.Top + bounds.Height / 2))).GetAwaiter().GetResult();
         Check(selection.Text.Contains("PaperDesk") && selection.Rectangles.Count > 0, "OCR cache provides mouse selection text and highlight rectangles");
         var whitespaceSelection = result.Select(new Point(bounds.Left - .02, bounds.Top + bounds.Height / 2), new Point(.8, bounds.Top + bounds.Height / 2));
@@ -112,6 +117,17 @@ internal static class Program
         Check(string.IsNullOrWhiteSpace(scan.ExtractText(0)) && !scan.IsDirty && scan.Revision == revision && scan.CanUndo == canUndo, "OCR leaves PDF text, revision, dirty flag and undo history unchanged");
         Check(SameImage(baseline, scan.Render(0, 600)) && scan.GetBytes().SequenceEqual(scanBytes), "OCR preserves PDF bytes and displayed image");
         scan.Save(scanPath); Check(File.ReadAllBytes(scanPath).SequenceEqual(scanBytes), "saving after background OCR keeps original file byte-identical");
+        var searchablePath = Path.Combine(output, "ocr-searchable-copy.pdf");
+        Check(Task.Run(() => OcrService.SaveSearchableCopyAsync(scan, searchablePath, [0],
+            options with { Enabled = false }, null, default)).GetAwaiter().GetResult() == 1, "explicit export works when background OCR is disabled");
+        using (var searchable = PdfDocument.Open(searchablePath))
+        {
+            var copiedHit = searchable.Search("PaperDesk", false, true, default).Single();
+            Check(copiedHit.Rectangles.Any(rect => rect.IntersectsWith(bounds)) &&
+                searchable.ExtractText(0).Contains("Проверка"), "reopened copy contains a searchable aligned Unicode layer");
+            Check(Pixels(baseline).SequenceEqual(Pixels(searchable.Render(0, 600))), "saved OCR layer is invisible and preserves page pixels");
+        }
+        Check(File.ReadAllBytes(scanPath).SequenceEqual(scanBytes) && !scan.IsDirty && scan.Revision == revision, "OCR export leaves the source file and tab untouched");
         view.Cancel();
         Check(ReferenceEquals(result, cache.Get(0, options)), "scrolling away retains completed recognition");
         Check(ReferenceEquals(result, cache.EnsureAsync(0, options, default).GetAwaiter().GetResult()), "returning to page reuses cached result");
@@ -138,6 +154,10 @@ internal static class Program
             mixed.Save(Path.Combine(output, "ocr-mixed.pdf"));
             var mixedResult = Task.Run(() => OcrService.RecognizePageAsync(mixed, 0, options)).GetAwaiter().GetResult();
             Check(mixedResult?.Text.Contains("PaperDesk") == true && mixed.ExtractText(0).Contains("Native footer"), "mixed pages recognize image text while preserving native text");
+            Check(mixedResult!.Search(0, "Native footer", false, false, mixed.Search("Native footer", false, false, default), 10, default).Count == 0,
+                "OCR search does not duplicate overlapping native results");
+            Check(Task.Run(() => OcrService.SaveSearchableCopyAsync(mixed, searchablePath, [0], options, null, default)).GetAwaiter().GetResult() == 0,
+                "OCR export skips a page with native text");
         }
         for (var rotation = 1; rotation < 4; rotation++)
         {
@@ -145,9 +165,19 @@ internal static class Program
             var recognized = Task.Run(() => OcrService.RecognizePageAsync(rotated, 0, options)).GetAwaiter().GetResult()!;
             var picked = Task.Run(() => recognized.Select(new Point(bounds.Left + .003, bounds.Top + bounds.Height / 2), new Point(bounds.Right - .003, bounds.Top + bounds.Height / 2))).GetAwaiter().GetResult();
             Check(picked.Text.Contains("PaperDesk"), "background OCR follows rotated PDF display coordinates " + rotation);
+            var rotatedPath = Path.Combine(output, $"ocr-searchable-rotation-{rotation}.pdf");
+            Check(Task.Run(() => OcrService.SaveSearchableCopyAsync(rotated, rotatedPath, [0], options, null, default)).GetAwaiter().GetResult() == 1,
+                "rotated scan exports an OCR layer " + rotation);
+            using var reopened = PdfDocument.Open(rotatedPath);
+            Check(reopened.Search("PaperDesk", false, true, default).Single().Rectangles.Any(rect => rect.IntersectsWith(bounds)) &&
+                Pixels(rotated.Render(0, 600)).SequenceEqual(Pixels(reopened.Render(0, 600))), "saved OCR rotates into the correct display position and stays invisible " + rotation);
         }
         using var cancelled = PdfDocument.FromBytes(scanBytes); using var cancellation = new CancellationTokenSource(); cancellation.Cancel();
         Throws<OperationCanceledException>(() => Task.Run(() => OcrService.RecognizePageAsync(cancelled, 0, options, cancellation.Token)).GetAwaiter().GetResult(), "obsolete OCR requests can be cancelled");
+        var beforeCancellation = File.ReadAllBytes(searchablePath);
+        Throws<OperationCanceledException>(() => Task.Run(() => OcrService.SaveSearchableCopyAsync(
+            cancelled, searchablePath, [0], options, null, cancellation.Token)).GetAwaiter().GetResult(), "OCR export can be cancelled");
+        Check(File.ReadAllBytes(searchablePath).SequenceEqual(beforeCancellation), "cancelled export preserves the destination");
         Check(!cancelled.IsDirty, "cancelled OCR does not modify scan");
         var importDirectory = Path.Combine(output, "ocr-import");
         Task.Run(() => OcrService.ImportLanguageAsync(Path.Combine(OcrService.BundledDirectory, "eng.traineddata"), importDirectory)).GetAwaiter().GetResult();
@@ -343,6 +373,41 @@ internal static class Program
         var note = doc.GetComments().First(c => c.Type == 1);
         doc.DeleteComment(note);
         Check(!doc.GetComments().Any(c => c.Type == 1), "delete annotation");
+    }
+
+    private static void TestPageGroupsAndMeasurement()
+    {
+        using var source = PdfDocument.FromBytes(PdfFixture.Create());
+        using var insert = PdfDocument.Create();
+        insert.AddText(0, new(.1, .2), "Third test page", 15);
+        using var combined = PdfDocument.CombinePages([source, insert]);
+        Check(combined.IsDirty && combined.PageCount == 3 && combined.ExtractText(2).Contains("Third test page"),
+            "combine preserves source order and creates an unsaved document");
+        combined.MovePages([0, 2], 1);
+        Check(combined.ExtractText(0).Contains("Second chapter") && combined.ExtractText(2).Contains("Third test page"), "bulk move preserves selected page order");
+        combined.Undo();
+        Check(combined.ExtractText(0) == source.ExtractText(0) && combined.ExtractText(1) == source.ExtractText(1), "bulk move is one undo operation");
+        var dimensions = combined.GetPages();
+        combined.RotatePages([0, 2], 1);
+        var rotated = combined.GetPages();
+        Check(rotated[0].Width == dimensions[0].Height && rotated[1] == dimensions[1] &&
+            rotated[2].Width == dimensions[2].Height, "bulk rotate changes selected pages only");
+        combined.DeletePages([0, 2]);
+        Check(combined.PageCount == 1 && combined.ExtractText(0).Contains("Second chapter"), "bulk delete removes selected pages only");
+        combined.Undo();
+        Check(combined.PageCount == 3, "bulk delete is one undo operation");
+        using var restricted = PdfDocument.FromBytes(PdfFixture.Create(encrypted: true, permissions: -20), "reader-secret");
+        var before = combined.GetBytes();
+        Throws<UnauthorizedAccessException>(() => combined.ImportPages([insert, restricted], 1), "import rejects a source without copy permission");
+        Check(combined.PageCount == 3 && combined.GetBytes().SequenceEqual(before), "bulk import rolls back preceding imports if a later source fails");
+
+        var pageItem = new PageItem(combined, new(0, 720, 360, "1"), 1);
+        pageItem.Measure(new(0, .4), new(.5, .4));
+        Check(Math.Abs(pageItem.Measurement!.Millimetres - 127) < .001, "measurement follows physical page dimensions");
+        pageItem.SetMeasurementScale(2);
+        pageItem.Zoom = 3;
+        pageItem.Measure(new(0, 0), new(0, 1));
+        Check(Math.Abs(pageItem.Measurement!.Millimetres - 254) < .001, "measurement calibration persists across zoom and subsequent segments");
     }
 
     private static void TestHistory(string output)
@@ -646,6 +711,22 @@ internal static class Program
         lastBitmap.Render(paginator.GetPage(8).Visual);
         Check(!SameImage(bitmap, lastBitmap), "last tile renders a different PDF region");
         Check(!doc.IsDirty, "printing layout never edits the original PDF");
+
+        using var a4 = PdfDocument.Create();
+        var detailPlan = PrintLayout.Create(a4.GetPages(), [0], paper, area, new PrintOptions { RasterDpi = 600 });
+        var detailPage = PrintService.CreatePaginator(a4, detailPlan).GetPage(0);
+        var rasters = FindRasters(((DrawingVisual)detailPage.Visual).Drawing).ToArray();
+        var expectedWidth = detailPlan.Sheets[0].Slots[0].Size.Width * 600 / 96;
+        Check(rasters.Length > 1 && rasters.All(raster => Math.Abs(raster.PixelWidth - expectedWidth) <= 1 &&
+            (long)raster.PixelHeight * raster.PixelWidth <= PdfDocument.MaxRenderPixels),
+            "600 DPI uses full-width raster bands within the per-raster pixel budget");
+
+        static IEnumerable<BitmapSource> FindRasters(Drawing drawing) => drawing switch
+        {
+            ImageDrawing { ImageSource: BitmapSource bitmap } => [bitmap],
+            DrawingGroup group => group.Children.SelectMany(FindRasters),
+            _ => []
+        };
     }
 
     private static void TestPrinterProfiles()
@@ -959,15 +1040,7 @@ internal static class Program
         SaveWindow(window, Path.Combine(output, "ocr-live-selection.png"));
         var finalSelection = scanControl.UpdateTextSelectionAsync(new Point(.08, .241), new Point(.8, .241), final: true);
         UntilComplete(finalSelection);
-        var previousClipboard = Clipboard.ContainsText() ? Clipboard.GetText() : null;
-        try
-        {
-            System.Windows.Input.ApplicationCommands.Copy.Execute(null, scanControl);
-            var clipboardDeadline = DateTime.UtcNow.AddSeconds(3);
-            while (workspace.Status != "Выделенный текст скопирован" && DateTime.UtcNow < clipboardDeadline) Pump(25);
-            Check(Clipboard.GetText().Contains("PaperDesk document test"), "page copy command writes selected OCR text to Windows clipboard");
-        }
-        finally { if (previousClipboard is not null) Clipboard.SetText(previousClipboard); }
+        TestOcrClipboard(workspace, scanControl);
         Check(scanControl.ContextMenu.Items.OfType<System.Windows.Controls.MenuItem>().Any(m => m.Command == System.Windows.Input.ApplicationCommands.Copy && m.CommandTarget == scanControl), "selection context menu routes Copy to its page");
         Check(workspace.OcrStatus.Contains("готов"), "status bar exposes OCR readiness");
         SaveWindow(window, Path.Combine(output, "ocr-background.png"));
@@ -982,6 +1055,41 @@ internal static class Program
         while (scanTab.Ocr.Get(1, new OcrOptions()) is null && DateTime.UtcNow < ocrDeadline) Pump(50);
         Check(scanTab.Ocr.Get(1, new OcrOptions())?.Text.Contains("PaperDesk") == true, "next stable viewed page is recognized automatically");
         Check(!workspace.Document!.IsDirty, "scrolling and automatic OCR never dirty the document");
+        workspace.FindCommand.Execute(null);
+        workspace.SearchScans = true;
+        workspace.Query = "PaperDesk";
+        var searchDeadline = DateTime.UtcNow.AddSeconds(20);
+        while (workspace.IsSearching && DateTime.UtcNow < searchDeadline) Pump(50);
+        Check(!workspace.IsSearching && workspace.Matches.Select(match => match.PageNumber).SequenceEqual([1, 2]) &&
+            workspace.SelectedMatch?.Rectangles.Count > 0, "WPF scan search displays and highlights results on both pages");
+        workspace.PreviousMatchCommand.Execute(null);
+        Check(workspace.CurrentPage == 2, "WPF scan search can jump to a match on another page");
+        workspace.Query = "";
+        workspace.SearchScans = false;
+        workspace.NavigationTab = 0;
+        Pump(100);
+        var thumbnails = (System.Windows.Controls.ListBox)window.FindName("ThumbnailList");
+        thumbnails.SelectedItems.Clear();
+        thumbnails.SelectedItems.Add(workspace.Pages[0]);
+        thumbnails.SelectedItems.Add(workspace.Pages[1]);
+        Pump(100);
+        Check(thumbnails.SelectedItems.Count == 2 && !workspace.DeletePageCommand.CanExecute(null), "multi-selection protects the last remaining page");
+        var sizes = workspace.Pages.Select(page => page.Info.Height).ToArray();
+        workspace.RotateCommand.Execute(null);
+        var rotateDeadline = DateTime.UtcNow.AddSeconds(8);
+        while (workspace.IsBusy && DateTime.UtcNow < rotateDeadline) Pump(40);
+        Check(thumbnails.SelectedItems.Count == 2 && workspace.Pages.Select(page => page.Info.Width).SequenceEqual(sizes), "rotation applies to all selected thumbnails");
+        workspace.UndoCommand.Execute(null);
+        while (workspace.IsBusy && DateTime.UtcNow < rotateDeadline) Pump(40);
+        Check(!workspace.Document.IsDirty, "undo restores the original scan after a grouped rotation");
+        workspace.Tool = DocumentTool.Measure;
+        var measurePage = workspace.Pages[workspace.CurrentPage - 1];
+        workspace.Measure(measurePage, new Point(.2, .35), new Point(.7, .5));
+        Pump(150);
+        Check(FindVisuals<PdfPageControl>(window).Any(control => !control.Thumbnail && control.MeasurementMode && control.Measurement == measurePage.Measurement) &&
+            workspace.CalibrateMeasurementCommand.CanExecute(null), "measurement is bound to the page overlay and enables calibration");
+        SaveWindow(window, Path.Combine(output, "measurement.png"));
+        workspace.Tool = DocumentTool.Select;
         UntilComplete(workspace.CloseTabAsync(workspace.ActiveTab!));
         Throws<ObjectDisposedException>(() => scanTab.Ocr.Get(0, new OcrOptions()), "closing tab discards OCR cache");
         UntilComplete(workspace.OpenPathAsync(Path.Combine(output, "sample.pdf")));
@@ -1083,6 +1191,9 @@ internal static class Program
         Pump(100);
 
         TestRestoreAfterCrash(output);
+        application.Shutdown();
+        Pump(50);
+        Dispatcher.CurrentDispatcher.InvokeShutdown();
     }
 
     private static void TestThemePanels(MainWindow owner, string output)
@@ -1178,6 +1289,9 @@ internal static class Program
             Check(dialog.PreviewReady, "own print preview renders without printer driver preview");
         }
         WaitPreview();
+        ((System.Windows.Controls.ComboBox)dialog.FindName("RasterDpiBox")).SelectedIndex = 2;
+        WaitPreview();
+        Check(dialog.Plan!.Options.RasterDpi == 600, "print quality control changes the raster DPI in the plan");
         SaveWindow(dialog, Path.Combine(output, "print-size-light.png"));
         ((System.Windows.Controls.TabControl)dialog.FindName("ModeTabs")).SelectedIndex = 1;
         WaitPreview();
@@ -1214,6 +1328,25 @@ internal static class Program
         owner.Themes.SetTheme(AppTheme.Light);
     }
 
+    private static void TestOcrClipboard(WorkspaceViewModel workspace, PdfPageControl scanControl)
+    {
+        string? previousClipboard;
+        try { previousClipboard = Clipboard.ContainsText() ? Clipboard.GetText() : null; }
+        catch (UnauthorizedAccessException)
+        {
+            Console.WriteLine("SKIP: Windows clipboard is inaccessible to this test process.");
+            return;
+        }
+        try
+        {
+            System.Windows.Input.ApplicationCommands.Copy.Execute(null, scanControl);
+            var deadline = DateTime.UtcNow.AddSeconds(3);
+            while (workspace.Status != "Выделенный текст скопирован" && DateTime.UtcNow < deadline) Pump(25);
+            Check(Clipboard.GetText().Contains("PaperDesk document test"), "page copy command writes selected OCR text to Windows clipboard");
+        }
+        finally { if (previousClipboard is not null) Clipboard.SetText(previousClipboard); }
+    }
+
     private static void TestRestoreAfterCrash(string output)
     {
         var directory = Path.Combine(output, "recovery-restore");
@@ -1246,6 +1379,7 @@ internal static class Program
     {
         public int Confirmations { get; private set; }
         public string[] ChooseOpenFiles() => [];
+        public string[] OrderPageSources(string[] paths) => paths;
         public string? ChooseSaveFile(string suggestedName) => null;
         public string? AskText(string title, string description, string value = "", bool multiline = false, bool password = false) => null;
         public (string Text, float Size)? EditText(string title, string description, string value, float fontSize, bool multiline) => null;

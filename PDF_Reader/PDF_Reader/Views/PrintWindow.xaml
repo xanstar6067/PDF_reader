@@ -39,6 +39,15 @@
                     <CheckBox x:Name="CollateBox" Content="Разобрать по копиям" IsChecked="True" Margin="0,0,16,6"/>
                     <CheckBox x:Name="GrayBox" Content="Оттенки серого" Margin="0,0,0,6"/>
                 </WrapPanel>
+                <DockPanel Margin="0,6,0,0">
+                    <TextBlock DockPanel.Dock="Left" Text="Качество печати" VerticalAlignment="Center" Margin="0,0,14,0"/>
+                    <ComboBox x:Name="RasterDpiBox" SelectedIndex="0" AutomationProperties.Name="Качество печати"
+                              ToolTip="На больших листах разрешение ограничено доступным размером растра">
+                        <ComboBoxItem Content="Обычное (200 DPI)"/>
+                        <ComboBoxItem Content="Высокое (300 DPI)"/>
+                        <ComboBoxItem Content="Для чертежей (600 DPI)"/>
+                    </ComboBox>
+                </DockPanel>
                 <Border Height="1" Background="{DynamicResource Line}" Margin="0,13"/>
                 <TextBlock Text="Страницы PDF" FontWeight="SemiBold" Margin="0,0,0,7"/>
                 <DockPanel>
